@@ -3,6 +3,7 @@ name = "naginata-firmware"
 version = "0.1.0"
 edition = "2021"
 description = "薙刀式 分割キーボード ファーム（RP2040 / Pico W, embassy）"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 naginata-core = { path = "../naginata-core" }

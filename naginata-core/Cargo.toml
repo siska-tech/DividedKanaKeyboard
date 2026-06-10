@@ -3,6 +3,7 @@ name = "naginata-core"
 version = "0.1.0"
 edition = "2021"
 description = "薙刀式 同時打鍵かな入力エンジン（no_std, ホストテスト可）"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # no_std 対応のパーフェクトハッシュ（実行時はテーブル参照のみ）

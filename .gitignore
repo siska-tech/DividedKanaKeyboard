@@ -8,7 +8,7 @@ target/
 Thumbs.db
 .DS_Store
 
-# 大岡氏作成の薙刀式v15資料（第三者著作物。公開リポジトリに含めない）
+# 大岡俊彦氏作成の薙刀式v15資料（第三者著作物。公開リポジトリに含めない）
 Documents/Reference/
 
 # PC設定ツール / トレーナー（別リポジトリ siska-tech.github.io で公開）
