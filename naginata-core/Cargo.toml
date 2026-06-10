@@ -1,0 +1,17 @@
+[package]
+name = "naginata-core"
+version = "0.1.0"
+edition = "2021"
+description = "薙刀式 同時打鍵かな入力エンジン（no_std, ホストテスト可）"
+
+[dependencies]
+# no_std 対応のパーフェクトハッシュ（実行時はテーブル参照のみ）
+phf = { version = "0.11", default-features = false }
+heapless = "0.8"
+
+[build-dependencies]
+phf_codegen = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# host テスト時のみ std が要る。コードは #![cfg_attr(not(test), no_std)]

@@ -1,0 +1,38 @@
+[package]
+name = "naginata-firmware"
+version = "0.1.0"
+edition = "2021"
+description = "薙刀式 分割キーボード ファーム（RP2040 / Pico W, embassy）"
+
+[dependencies]
+naginata-core = { path = "../naginata-core" }
+
+# --- embassy 一式（最新系に固定）-----------------------------------------
+# 注意: embassy はバージョン追従が速い。API差分は公式 examples に合わせる。
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+embassy-rp = { version = "0.10", features = ["rp2040", "time-driver", "critical-section-impl", "unstable-pac"] }
+embassy-time = { version = "0.5" }
+embassy-usb = { version = "0.6" }
+embassy-futures = { version = "0.1" }
+embassy-sync = { version = "0.8" }
+
+heapless = "0.8"
+embedded-io-async = "0.7"
+smart-leds = "0.4"
+
+# Cortex-M ランタイム（inline-asm は不要: 近年の cortex-m は stable asm 内蔵。
+# かつ ARMv6-M(Pico) では BASEPRI 等が無く inline-asm はビルド不可）。
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+
+# ブリングアップ用パニックハンドラ（defmt版衝突を避けるため halt）。
+# RTTログが要るなら後で defmt-rtt + panic-probe へ差し替え。
+panic-halt = "1"
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "z"
+
+[profile.dev]
+opt-level = 1

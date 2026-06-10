@@ -1,0 +1,4 @@
+[toolchain]
+# RP2040 ターゲット。`rustup` が自動でコンポーネントを揃える。
+targets = ["thumbv6m-none-eabi"]
+components = ["rust-src"]

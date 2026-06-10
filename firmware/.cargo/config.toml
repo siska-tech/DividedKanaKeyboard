@@ -1,0 +1,19 @@
+# RP2040 = Cortex-M0+ → thumbv6m-none-eabi
+# 事前に: rustup target add thumbv6m-none-eabi
+
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+# 書込み: USBマスストレージ(BOOTSEL)へ UF2。probe無し運用なら elf2uf2-rs。
+#   cargo install elf2uf2-rs
+runner = "elf2uf2-rs --deploy --serial"
+# probe-rs(SWD/デバッガ)運用なら下記に差し替え:
+# runner = "probe-rs run --chip RP2040"
+
+rustflags = [
+  "-C", "link-arg=--nmagic",
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tlink-rp.x",
+  # defmt を使う場合は "-C", "link-arg=-Tdefmt.x" を追加
+]

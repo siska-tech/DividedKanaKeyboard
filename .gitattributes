@@ -1,0 +1,9 @@
+# テキストは自動正規化（リポジトリ内は LF）
+* text=auto eol=lf
+
+# バイナリ（CRLF変換でデータ破損を防ぐ）
+*.pdf binary
+*.epro2 binary
+*.uf2 binary
+*.png binary
+*.jpg binary

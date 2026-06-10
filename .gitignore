@@ -1,0 +1,15 @@
+# Rust build artifacts
+target/
+
+# 生成物（ファームの書込みイメージ。elf2uf2-rs で再生成可能）
+*.uf2
+
+# OS / editor
+Thumbs.db
+.DS_Store
+
+# 大岡氏作成の薙刀式v15資料（第三者著作物。公開リポジトリに含めない）
+Documents/Reference/
+
+# PC設定ツール / トレーナー（別リポジトリ siska-tech.github.io で公開）
+site/
