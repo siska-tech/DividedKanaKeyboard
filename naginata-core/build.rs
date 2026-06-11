@@ -24,6 +24,45 @@ struct Layout {
     modes: Vec<ModeDef>,
     matrix_left: Vec<MatrixPos>,
     matrix_right: Vec<MatrixPos>,
+    /// 薙刀式キー以外も含む全物理スイッチ位置（READ_MATRIX_FULL 用, #05-future-work §2 Tier 1）。
+    /// 省略可: 未記載の半身は matrix_* の位置のみが全物理キーとして扱われる。
+    #[serde(default)]
+    physical_left: Vec<PhysPos>,
+    #[serde(default)]
+    physical_right: Vec<PhysPos>,
+    /// 物理形状（READ_LAYOUT 用, #05-future-work §2 Tier 2）。省略可:
+    /// 空なら READ_LAYOUT 非対応（INFO capability LAYOUT が立たない）。
+    #[serde(default)]
+    layout_left: Vec<LayoutPos>,
+    #[serde(default)]
+    layout_right: Vec<LayoutPos>,
+}
+
+/// 物理スイッチ位置（sc 割当なしの位置も列挙できる）。
+#[derive(Deserialize)]
+struct PhysPos {
+    row: u8,
+    col: u8,
+}
+
+/// キー形状（u 単位の絶対座標。0.25u 刻みに量子化してエンコード）。
+#[derive(Deserialize)]
+struct LayoutPos {
+    row: u8,
+    col: u8,
+    x: f32,
+    y: f32,
+    #[serde(default = "one")]
+    w: f32,
+    #[serde(default = "one")]
+    h: f32,
+    /// 回転（度, -128..127。キー中心まわり）。
+    #[serde(default)]
+    rot: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 /// 編集モード（2キートリガで持続モード→後続キーを編集アクションへ）。
@@ -312,6 +351,15 @@ fn main() {
     // MATRIX: 位置(row*16+col, u8) -> sc(u8)。手番ごと。
     write_matrix(&mut f, "MATRIX_LEFT", &layout.matrix_left);
     write_matrix(&mut f, "MATRIX_RIGHT", &layout.matrix_right);
+
+    // PHYS: 全物理スイッチ (位置, sc) の昇順スライス（READ_MATRIX_FULL 用）。
+    // matrix_* ∪ physical_*。sc=0 は薙刀式未割当（EXTRA の割当候補）。
+    write_phys(&mut f, "PHYS_LEFT", &layout.matrix_left, &layout.physical_left);
+    write_phys(&mut f, "PHYS_RIGHT", &layout.matrix_right, &layout.physical_right);
+
+    // LAYOUT: キー形状 (位置, x, y, w, h, rot)（READ_LAYOUT 用）。x/y/w/h は 0.25u 単位。
+    write_layout(&mut f, "LAYOUT_LEFT", &layout.layout_left);
+    write_layout(&mut f, "LAYOUT_RIGHT", &layout.layout_right);
 }
 
 /// 2キーを sorted で u16 にパック。keymap.rs の combo2_key と一致させること。
@@ -335,4 +383,48 @@ fn write_matrix(f: &mut fs::File, name: &str, rows: &[MatrixPos]) {
         m.entry(pos, &format!("{}u8", p.sc));
     }
     writeln!(f, "pub static {name}: phf::Map<u8, u8> = {};", m.build()).unwrap();
+}
+
+fn write_layout(f: &mut fs::File, name: &str, list: &[LayoutPos]) {
+    let q = |v: f32| -> u8 {
+        let x = (v * 4.0).round();
+        assert!((0.0..=255.0).contains(&x), "layout 値が 0..63.75u を超過: {v}");
+        x as u8
+    };
+    let entries: Vec<String> = list
+        .iter()
+        .map(|p| {
+            let pos = (p.row << 4) | (p.col & 0x0f);
+            let rot = p.rot.round();
+            assert!((-128.0..=127.0).contains(&rot), "rot が i8 範囲外: {}", p.rot);
+            format!(
+                "({pos}u8, {}u8, {}u8, {}u8, {}u8, {}i8)",
+                q(p.x), q(p.y), q(p.w), q(p.h), rot as i8
+            )
+        })
+        .collect();
+    writeln!(
+        f,
+        "pub static {name}: &[(u8, u8, u8, u8, u8, i8)] = &[{}];",
+        entries.join(", ")
+    )
+    .unwrap();
+}
+
+fn write_phys(f: &mut fs::File, name: &str, matrix: &[MatrixPos], phys: &[PhysPos]) {
+    use std::collections::BTreeMap;
+    let mut m: BTreeMap<u8, u8> = matrix
+        .iter()
+        .map(|p| ((p.row << 4) | (p.col & 0x0f), p.sc))
+        .collect();
+    for p in phys {
+        m.entry((p.row << 4) | (p.col & 0x0f)).or_insert(0);
+    }
+    let entries: Vec<String> = m.iter().map(|(pos, sc)| format!("({pos}u8, {sc}u8)")).collect();
+    writeln!(
+        f,
+        "pub static {name}: &[(u8, u8)] = &[{}];",
+        entries.join(", ")
+    )
+    .unwrap();
 }

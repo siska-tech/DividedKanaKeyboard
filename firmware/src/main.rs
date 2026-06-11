@@ -13,7 +13,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_futures::join::join3;
@@ -79,6 +79,28 @@ static USB_CONFIGURED: AtomicBool = AtomicBool::new(false);
 /// learn-key（#12 フェーズ3）: 最後に押された物理位置 `(hand<<12)|(row<<4)|col`。
 /// bit15=fresh（READ_LASTKEY で取得時にクリア）。未使用キーの (hand,row,col) 同定に使う。
 pub static LAST_KEY: AtomicU16 = AtomicU16::new(0);
+
+/// ホールド（TAG_HOLD, #05-future-work §1）: 保持中の修飾ビット。
+/// engine_task が更新し、usb_task の HID 送出時に全レポートへ OR される。
+static HELD_MODS: AtomicU8 = AtomicU8::new(0);
+/// ホールド中の非修飾 usage（8bit×4 パック、0=空きスロット）。同上。
+static HELD_USAGES: AtomicU32 = AtomicU32::new(0);
+
+/// ホールド状態を送出レポートへ合成する（usb_task の送出直前に呼ぶ）。
+/// 修飾は OR、非修飾 usage は空きスロット（r[2..8]）へ追記（満杯なら黙って落とす）。
+fn merge_held(r: &mut [u8; 8]) {
+    r[0] |= HELD_MODS.load(Ordering::Relaxed);
+    let us = HELD_USAGES.load(Ordering::Relaxed);
+    for i in 0..4 {
+        let u = ((us >> (8 * i)) & 0xff) as u8;
+        if u == 0 || r[2..8].contains(&u) {
+            continue;
+        }
+        if let Some(slot) = r[2..8].iter_mut().find(|b| **b == 0) {
+            *slot = u;
+        }
+    }
+}
 
 /// 物理位置を u16 にパック（hand: Left=0 / Right=1, row<4bit, col<4bit）。
 pub fn pack_pos(hand: Hand, row: u8, col: u8) -> u16 {
@@ -157,6 +179,7 @@ async fn main(spawner: Spawner) {
     let cfg = config_store::read_config(&mut flash).unwrap_or_default();
     let overlay = build_overlay(&cfg);
     let direct = build_direct(&cfg);
+    let custom = build_custom(&cfg);
     let params = cfg.params;
 
     // --- 分割UART（UART0: GP0=TX, GP1=RX。TRRSでクロス配線済）---------------
@@ -181,8 +204,10 @@ async fn main(spawner: Spawner) {
         params.window_ms as u32,
         params.repeat_delay_ms as u32,
         params.repeat_interval_ms as u32,
+        params.flags,
         overlay,
         direct,
+        custom,
     ).unwrap());
 
     // --- WS2812B ステータスLED（GP28, 2個）--------------------------------
@@ -273,6 +298,9 @@ unsafe fn oval_to_action(
             *kpos += n;
             Action::Keys(sl)
         }
+        // Hold はタップ Action に変換できない（build_direct が Direct::Hold へ分類済み。
+        // 他セクションに紛れた場合は無視）。
+        OverrideVal::Hold(_) => Action::None,
     }
 }
 
@@ -359,32 +387,99 @@ fn build_overlay(cfg: &Config) -> &'static keymap::Overlay {
     }
 }
 
+/// 直接キー（EXTRA）/ カスタムレイヤーの実行時解釈（#05-future-work §1/§3）。
+#[derive(Clone, Copy)]
+enum Direct {
+    /// タップ出力（従来動作）。押下時に Action を1回送出。
+    Tap(Action),
+    /// 物理キーの press/release に同期して (usage, mod) を HID レポートに保持/解除。
+    Hold(nghid::KeyPress),
+    /// レイヤー: ホールド中有効（擬似 usage 0xF0|n）。layer 0 = QWERTY パススルー。
+    Mo(u8),
+    /// レイヤー: トグル（擬似 usage 0xF8|n）。
+    Tg(u8),
+}
+
+/// OverrideVal → Direct の分類（擬似 usage は HID に出さず内部動作へ変換）。
+/// タップ列への変換が必要な場合は None（呼び出し側で oval_to_action）。
+fn classify_pseudo(v: &naginata_core::config::OverrideVal) -> Option<Direct> {
+    use naginata_core::config::{pseudo, OverrideVal};
+    let map = |u: u8, m: u8, hold: bool| -> Option<Direct> {
+        if let Some((tg, n)) = pseudo::layer_op(u) {
+            Some(if tg { Direct::Tg(n) } else { Direct::Mo(n) })
+        } else if hold {
+            Some(Direct::Hold(nghid::KeyPress { usage: u, modifiers: m }))
+        } else {
+            None
+        }
+    };
+    match v {
+        OverrideVal::Hold((u, m)) => map(*u, *m, true),
+        OverrideVal::Keys(kv) if kv.len() == 1 => map(kv[0].0, kv[0].1, false),
+        _ => None,
+    }
+}
+
 /// 起動時に Config.extra（未使用物理キーの直接割当, #12 フェーズ3）を `static` アリーナへ展開し、
-/// `(pack_pos(hand,row,col), Action)` の `&'static` スライスを返す。boot で一度だけ。
-fn build_direct(cfg: &Config) -> &'static [(u16, Action)] {
+/// `(pack_pos(hand,row,col), Direct)` の `&'static` スライスを返す。boot で一度だけ。
+fn build_direct(cfg: &Config) -> &'static [(u16, Direct)] {
     use naginata_core::config as cfgmod;
     const BCAP: usize = 256;
     const KCAP: usize = 256;
     static mut BYTES: [u8; BCAP] = [0u8; BCAP];
     static mut KPS: [nghid::KeyPress; KCAP] = [nghid::KeyPress { usage: 0, modifiers: 0 }; KCAP];
-    static mut TABLE: [(u16, Action); cfgmod::MAX_EXTRA] = [(0u16, Action::None); cfgmod::MAX_EXTRA];
+    static mut TABLE: [(u16, Direct); cfgmod::MAX_EXTRA] =
+        [(0u16, Direct::Tap(Action::None)); cfgmod::MAX_EXTRA];
     let mut bpos = 0usize;
     let mut kpos = 0usize;
     let mut n = 0usize;
     unsafe {
         let bytes = core::ptr::addr_of_mut!(BYTES) as *mut u8;
         let kps = core::ptr::addr_of_mut!(KPS) as *mut nghid::KeyPress;
-        let tp = core::ptr::addr_of_mut!(TABLE) as *mut (u16, Action);
+        let tp = core::ptr::addr_of_mut!(TABLE) as *mut (u16, Direct);
         for (hand, row, col, v) in &cfg.extra {
             if n >= cfgmod::MAX_EXTRA {
                 break;
             }
-            let a = oval_to_action(v, bytes, BCAP, &mut bpos, kps, KCAP, &mut kpos);
+            let d = classify_pseudo(v).unwrap_or_else(|| {
+                Direct::Tap(oval_to_action(v, bytes, BCAP, &mut bpos, kps, KCAP, &mut kpos))
+            });
             let h = if *hand == 0 { Hand::Left } else { Hand::Right };
-            *tp.add(n) = (pack_pos(h, *row, *col), a);
+            *tp.add(n) = (pack_pos(h, *row, *col), d);
             n += 1;
         }
-        core::slice::from_raw_parts(tp as *const (u16, Action), n)
+        core::slice::from_raw_parts(tp as *const (u16, Direct), n)
+    }
+}
+
+/// 起動時に Config.custom（カスタムレイヤー差分, #05 §3 Tier B）を `static` アリーナへ展開し、
+/// `((layer<<8)|sc, Direct)` の `&'static` スライスを返す。boot で一度だけ。
+fn build_custom(cfg: &Config) -> &'static [(u16, Direct)] {
+    use naginata_core::config as cfgmod;
+    const BCAP: usize = 512;
+    const KCAP: usize = 384;
+    static mut BYTES: [u8; BCAP] = [0u8; BCAP];
+    static mut KPS: [nghid::KeyPress; KCAP] = [nghid::KeyPress { usage: 0, modifiers: 0 }; KCAP];
+    static mut TABLE: [(u16, Direct); cfgmod::MAX_CUSTOM] =
+        [(0u16, Direct::Tap(Action::None)); cfgmod::MAX_CUSTOM];
+    let mut bpos = 0usize;
+    let mut kpos = 0usize;
+    let mut n = 0usize;
+    unsafe {
+        let bytes = core::ptr::addr_of_mut!(BYTES) as *mut u8;
+        let kps = core::ptr::addr_of_mut!(KPS) as *mut nghid::KeyPress;
+        let tp = core::ptr::addr_of_mut!(TABLE) as *mut (u16, Direct);
+        for (layer, sc, v) in &cfg.custom {
+            if n >= cfgmod::MAX_CUSTOM {
+                break;
+            }
+            let d = classify_pseudo(v).unwrap_or_else(|| {
+                Direct::Tap(oval_to_action(v, bytes, BCAP, &mut bpos, kps, KCAP, &mut kpos))
+            });
+            *tp.add(n) = (((*layer as u16) << 8) | *sc as u16, d);
+            n += 1;
+        }
+        core::slice::from_raw_parts(tp as *const (u16, Direct), n)
     }
 }
 
@@ -498,7 +593,8 @@ async fn usb_task(driver: Driver<'static, USB>, mut flash: handedness::HandFlash
     let usb_fut = usb.run();
     let hid_fut = async {
         loop {
-            let report = REPORTS.receive().await;
+            let mut report = REPORTS.receive().await;
+            merge_held(&mut report); // ホールド中のキーを全レポートへ合成（#05 §1）
             let _ = writer.write(&report).await;
         }
     };
@@ -609,14 +705,30 @@ async fn engine_task(
     window_ms: u32,
     repeat_delay_ms: u32,
     repeat_interval_ms: u32,
+    param_flags: u8,
     overlay: &'static keymap::Overlay,
-    direct: &'static [(u16, Action)],
+    direct: &'static [(u16, Direct)],
+    custom: &'static [(u16, Direct)],
 ) {
+    use naginata_core::config::PFLAG_PASS_IME;
+
     let mut engine = Engine::new();
     // #12: flash 設定（パラメータ＋全カテゴリ オーバーレイ）を起動時に適用。
     engine.set_window(window_ms);
     engine.set_repeat(repeat_delay_ms, repeat_interval_ms);
     engine.set_overlay(overlay);
+
+    // ホールド中のキー（位置, KeyPress）。変化のたびに HELD_* atomics へ反映。
+    let mut holds: heapless::Vec<(u16, nghid::KeyPress), 8> = heapless::Vec::new();
+    // レイヤー活性状態（#05 §3）: MO はホールド一覧（位置キー）、TG はビットマスク。
+    // 活性レイヤー = 最上位ビット。layer 0 = QWERTY パススルー、1..7 = カスタム（透過既定）。
+    let mut mo_holds: heapless::Vec<(u16, u8), 4> = heapless::Vec::new();
+    let mut tg_mask: u8 = 0;
+    let mut cur_layer: Option<u8> = None;
+    // レイヤー（透過 = パススルー）中の押下状態。レイヤー切替時にクリア。
+    let mut pass_mods: u8 = 0;
+    let mut pass_keys: heapless::Vec<u8, 6> = heapless::Vec::new();
+
     let mut ticker = Ticker::every(Duration::from_millis(5));
     loop {
         match select(ENGINE_IN.receive(), ticker.next()).await {
@@ -629,7 +741,105 @@ async fn engine_task(
                 if ev.pressed {
                     LAST_KEY.store(pack_pos(ev.hand, ev.row, ev.col) | 0x8000, Ordering::Relaxed);
                 }
-                if let Some(sc) = keymap::matrix_to_sc(ev.hand, ev.row, ev.col) {
+                let pk = pack_pos(ev.hand, ev.row, ev.col);
+                let mut layers_dirty = false;
+
+                // ① 直接キー（EXTRA）。薙刀式位置とは重複しないので最初に判定し、
+                //    レイヤー活性中でも有効（MO の解放・TG の解除のため必須）。
+                if let Some((_, d)) = direct.iter().find(|(k, _)| *k == pk) {
+                    match *d {
+                        Direct::Tap(a) => {
+                            if ev.pressed {
+                                emit_action(a);
+                            }
+                        }
+                        Direct::Hold(kp) => {
+                            if ev.pressed {
+                                let _ = holds.push((pk, kp));
+                            } else if let Some(i) = holds.iter().position(|(p, _)| *p == pk) {
+                                holds.swap_remove(i);
+                            }
+                            publish_holds(&holds);
+                            // ホールドのみのレポートを即時送出（merge_held が合成）。
+                            let _ = REPORTS.try_send(usb_hid::release_report());
+                        }
+                        Direct::Mo(n) => {
+                            if ev.pressed {
+                                let _ = mo_holds.push((pk, n));
+                            } else if let Some(i) = mo_holds.iter().position(|(p, _)| *p == pk) {
+                                mo_holds.swap_remove(i);
+                            }
+                            layers_dirty = true;
+                        }
+                        Direct::Tg(n) => {
+                            if ev.pressed {
+                                tg_mask ^= 1 << n;
+                                layers_dirty = true;
+                            }
+                        }
+                    }
+                } else if let Some(layer) = cur_layer {
+                    // ② レイヤー活性中: カスタムエントリ → 透過（パススルー）。
+                    // 解放はまず押下記録（MO/ホールド）から対応する
+                    // （押下後にレイヤーが切り替わっていても解除できるように）。
+                    if !ev.pressed && mo_holds.iter().any(|(p, _)| *p == pk) {
+                        let i = mo_holds.iter().position(|(p, _)| *p == pk).unwrap();
+                        mo_holds.swap_remove(i);
+                        layers_dirty = true;
+                    } else if !ev.pressed && holds.iter().any(|(p, _)| *p == pk) {
+                        let i = holds.iter().position(|(p, _)| *p == pk).unwrap();
+                        holds.swap_remove(i);
+                        publish_holds(&holds);
+                        let _ = REPORTS.try_send(usb_hid::release_report());
+                    } else if let Some(sc) = keymap::matrix_to_sc(ev.hand, ev.row, ev.col) {
+                        let ck = ((layer as u16) << 8) | sc as u16;
+                        if let Some((_, d)) = custom.iter().find(|(k, _)| *k == ck) {
+                            match *d {
+                                Direct::Tap(a) => {
+                                    if ev.pressed {
+                                        emit_action(a);
+                                    }
+                                }
+                                Direct::Hold(kp) => {
+                                    if ev.pressed {
+                                        let _ = holds.push((pk, kp));
+                                        publish_holds(&holds);
+                                        let _ = REPORTS.try_send(usb_hid::release_report());
+                                    }
+                                }
+                                Direct::Mo(n) => {
+                                    if ev.pressed {
+                                        let _ = mo_holds.push((pk, n));
+                                        layers_dirty = true;
+                                    }
+                                }
+                                Direct::Tg(n) => {
+                                    if ev.pressed {
+                                        tg_mask ^= 1 << n;
+                                        layers_dirty = true;
+                                    }
+                                }
+                            }
+                        } else if let Some(u) = nghid::sc_to_usage(sc) {
+                            // 透過: sc→usage を素通し（press/release 同期）。
+                            if let Some(bit) = nghid::modifier_bit(u) {
+                                if ev.pressed {
+                                    pass_mods |= bit;
+                                } else {
+                                    pass_mods &= !bit;
+                                }
+                            } else if ev.pressed {
+                                if !pass_keys.contains(&u) {
+                                    let _ = pass_keys.push(u);
+                                }
+                            } else if let Some(i) = pass_keys.iter().position(|x| *x == u) {
+                                pass_keys.remove(i);
+                            }
+                            send_pass_report(pass_mods, &pass_keys);
+                        }
+                    }
+                } else if let Some(sc) = keymap::matrix_to_sc(ev.hand, ev.row, ev.col) {
+                    // ③ 通常: 薙刀式エンジン。
                     let mut sink = |a: Action| emit_action(a);
                     if ev.pressed {
                         engine.press(sc, now, &mut sink);
@@ -637,11 +847,29 @@ async fn engine_task(
                         engine.release(sc, now, &mut sink);
                     }
                     HELD_SHIFTS.store(engine.display_shifts(), Ordering::Relaxed); // LED用
-                } else if ev.pressed {
-                    // 薙刀式 sc が無い物理キー → 直接キー割当(#12 フェーズ3, タップ出力)。
-                    let pk = pack_pos(ev.hand, ev.row, ev.col);
-                    if let Some((_, a)) = direct.iter().find(|(k, _)| *k == pk) {
-                        emit_action(*a);
+                }
+
+                // レイヤー活性の再計算と遷移処理。
+                if layers_dirty {
+                    let new_layer = active_layer(&mo_holds, tg_mask);
+                    if new_layer != cur_layer {
+                        // カスタムレイヤー由来のホールドは解除（EXTRA 由来は維持）。
+                        let mut i = 0;
+                        while i < holds.len() {
+                            if direct.iter().any(|(k, _)| *k == holds[i].0) {
+                                i += 1;
+                            } else {
+                                holds.swap_remove(i);
+                            }
+                        }
+                        publish_holds(&holds);
+                        layer_transition(
+                            &mut cur_layer,
+                            new_layer,
+                            param_flags & PFLAG_PASS_IME != 0,
+                            &mut pass_mods,
+                            &mut pass_keys,
+                        );
                     }
                 }
             }
@@ -654,6 +882,70 @@ async fn engine_task(
             }
         }
     }
+}
+
+/// MO ホールド＋TG マスクから活性レイヤーを求める（最上位ビット優先。0 なら非活性）。
+fn active_layer(mo_holds: &heapless::Vec<(u16, u8), 4>, tg_mask: u8) -> Option<u8> {
+    let mut mask = tg_mask;
+    for (_, l) in mo_holds {
+        mask |= 1 << l;
+    }
+    if mask == 0 {
+        None
+    } else {
+        Some(7 - mask.leading_zeros() as u8)
+    }
+}
+
+/// ホールド一覧 → HELD_MODS / HELD_USAGES atomics へ反映する。
+/// 修飾 usage（0xE0..=0xE7）は修飾ビットへ畳み込み、非修飾 usage は最大4スロット。
+fn publish_holds(holds: &heapless::Vec<(u16, nghid::KeyPress), 8>) {
+    let mut mods = 0u8;
+    let mut us: u32 = 0;
+    let mut n = 0u32;
+    for (_, kp) in holds {
+        mods |= kp.modifiers;
+        if let Some(b) = nghid::modifier_bit(kp.usage) {
+            mods |= b;
+        } else if kp.usage != 0 && n < 4 {
+            us |= (kp.usage as u32) << (8 * n);
+            n += 1;
+        }
+    }
+    HELD_MODS.store(mods, Ordering::Relaxed);
+    HELD_USAGES.store(us, Ordering::Relaxed);
+}
+
+/// レイヤー遷移を処理する: 透過押下状態のクリア＋解放レポート送出、
+/// 非活性↔活性の切替時は必要に応じ IME 切替（有効化→LANG2 / 解除→LANG1）。
+fn layer_transition(
+    cur: &mut Option<u8>,
+    new: Option<u8>,
+    ime: bool,
+    pass_mods: &mut u8,
+    pass_keys: &mut heapless::Vec<u8, 6>,
+) {
+    if *cur == new {
+        return;
+    }
+    *pass_mods = 0;
+    pass_keys.clear();
+    let _ = REPORTS.try_send(usb_hid::release_report());
+    if ime && (cur.is_none() != new.is_none()) {
+        let usage = if new.is_some() { 0x91 } else { 0x90 }; // LANG2（英数）/ LANG1（かな）
+        send_stroke(nghid::KeyPress { usage, modifiers: 0 });
+    }
+    *cur = new;
+}
+
+/// パススルー中の押下状態をそのまま 8B レポートとして送出する（最大6キー＋修飾）。
+fn send_pass_report(mods: u8, keys: &heapless::Vec<u8, 6>) {
+    let mut r = [0u8; 8];
+    r[0] = mods;
+    for (i, u) in keys.iter().take(6).enumerate() {
+        r[2 + i] = *u;
+    }
+    let _ = REPORTS.try_send(r);
 }
 
 /// Action → HID キーストローク（押下/解放レポート）→ チャネル送出。

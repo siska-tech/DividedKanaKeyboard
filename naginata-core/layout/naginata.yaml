@@ -361,3 +361,123 @@ matrix_right:
   - { row: 3, col: 5, sc: 0x31 }
   # r4: SPACE（センターシフト）
   - { row: 4, col: 5, sc: 0x39 }
+
+# --- 全物理スイッチ位置（READ_MATRIX_FULL / #05-future-work §2 Tier 1）-------
+# matrix_left/right に載らない（薙刀式 sc 未割当の）物理スイッチの列挙。
+# 設定ツールのキーボード描画に破線キーとして現れ、クリックで EXTRA（直接キー）を
+# 割り当てられる。row/col は実機採取（2026-06-12, READ_LASTKEY のキー学習）。
+# コメントの刻印名は元キーキャップの表記（出力の割当自体はツールの EXTRA で行う）。
+physical_left:
+  # r0: ESC＋ファンクション行
+  - { row: 0, col: 0 }   # Esc
+  - { row: 0, col: 1 }   # F1
+  - { row: 0, col: 2 }   # F2
+  - { row: 0, col: 3 }   # F3
+  - { row: 0, col: 4 }   # F4
+  - { row: 0, col: 5 }   # F5
+  - { row: 0, col: 6 }   # F6
+  # 左端列（Macro1..4）
+  - { row: 1, col: 0 }   # Macro1
+  - { row: 2, col: 0 }   # Macro2
+  - { row: 3, col: 0 }   # Macro3
+  - { row: 4, col: 0 }   # Macro4
+  # 親指行
+  - { row: 4, col: 1 }   # Win（左手のみの追加キー）
+  - { row: 4, col: 3 }   # Enter/Ctrl
+  - { row: 4, col: 4 }   # Lower
+
+physical_right:
+  # r0: ファンクション行＋Del（c1=外側=F12 → c6=内側=F7）
+  - { row: 0, col: 0 }   # Del（右端）
+  - { row: 0, col: 1 }   # F12
+  - { row: 0, col: 2 }   # F11
+  - { row: 0, col: 3 }   # F10
+  - { row: 0, col: 4 }   # F9
+  - { row: 0, col: 5 }   # F8
+  - { row: 0, col: 6 }   # F7
+  # 右端列
+  - { row: 1, col: 0 }   # PageUp
+  - { row: 2, col: 0 }   # PageDown
+  - { row: 3, col: 0 }   # Home
+  - { row: 4, col: 0 }   # End
+  # 親指行
+  - { row: 4, col: 3 }   # BS/Shift
+  - { row: 4, col: 4 }   # Raise
+
+# --- 物理形状（READ_LAYOUT / #05-future-work §2 Tier 2）----------------------
+# キーごとの絶対座標・サイズ・回転（u 単位、0.25u 刻み。rot は度、キー中心まわり）。
+# 記載すると INFO capability LAYOUT が立ち、設定ツールが実機通りの形状で描画する。
+# w/h 省略時 1u、rot 省略時 0。座標は各半身の左上が原点。
+# 実機形状（2026-06-12 採取）: 全キー 1u のフラット格子。端列と F 行が 0.5u 離れる。
+layout_left:
+  # r0: Esc＋F1-F6（主ブロックから 0.5u 上に分離）
+  - { row: 0, col: 0, x: 0,   y: 0 }   # Esc
+  - { row: 0, col: 1, x: 1.5, y: 0 }   # F1
+  - { row: 0, col: 2, x: 2.5, y: 0 }   # F2
+  - { row: 0, col: 3, x: 3.5, y: 0 }   # F3
+  - { row: 0, col: 4, x: 4.5, y: 0 }   # F4
+  - { row: 0, col: 5, x: 5.5, y: 0 }   # F5
+  - { row: 0, col: 6, x: 6.5, y: 0 }   # F6
+  # r1（左端列は主ブロックから 0.5u 左に分離）
+  - { row: 1, col: 0, x: 0,   y: 1.5 } # Macro1
+  - { row: 1, col: 1, x: 1.5, y: 1.5 } # Q
+  - { row: 1, col: 2, x: 2.5, y: 1.5 } # W
+  - { row: 1, col: 3, x: 3.5, y: 1.5 } # E
+  - { row: 1, col: 4, x: 4.5, y: 1.5 } # R
+  - { row: 1, col: 5, x: 5.5, y: 1.5 } # T
+  # r2
+  - { row: 2, col: 0, x: 0,   y: 2.5 } # Macro2
+  - { row: 2, col: 1, x: 1.5, y: 2.5 } # A
+  - { row: 2, col: 2, x: 2.5, y: 2.5 } # S
+  - { row: 2, col: 3, x: 3.5, y: 2.5 } # D
+  - { row: 2, col: 4, x: 4.5, y: 2.5 } # F
+  - { row: 2, col: 5, x: 5.5, y: 2.5 } # G
+  # r3
+  - { row: 3, col: 0, x: 0,   y: 3.5 } # Macro3
+  - { row: 3, col: 1, x: 1.5, y: 3.5 } # Z
+  - { row: 3, col: 2, x: 2.5, y: 3.5 } # X
+  - { row: 3, col: 3, x: 3.5, y: 3.5 } # C
+  - { row: 3, col: 4, x: 4.5, y: 3.5 } # V
+  - { row: 3, col: 5, x: 5.5, y: 3.5 } # B
+  # r4（親指行）
+  - { row: 4, col: 0, x: 0,   y: 4.5 } # Macro4
+  - { row: 4, col: 1, x: 1.5, y: 4.5 } # Win
+  - { row: 4, col: 3, x: 3.5, y: 4.5 } # Enter/Ctrl
+  - { row: 4, col: 4, x: 4.5, y: 4.5 } # Lower
+  - { row: 4, col: 5, x: 5.5, y: 4.5 } # Space
+
+layout_right:
+  # r0: F7-F12＋Del（c6=内側 → c1=外側、c0=右端）
+  - { row: 0, col: 6, x: 0,   y: 0 }   # F7
+  - { row: 0, col: 5, x: 1,   y: 0 }   # F8
+  - { row: 0, col: 4, x: 2,   y: 0 }   # F9
+  - { row: 0, col: 3, x: 3,   y: 0 }   # F10
+  - { row: 0, col: 2, x: 4,   y: 0 }   # F11
+  - { row: 0, col: 1, x: 5,   y: 0 }   # F12
+  - { row: 0, col: 0, x: 6.5, y: 0 }   # Del
+  # r1（右端列は主ブロックから 0.5u 右に分離）
+  - { row: 1, col: 5, x: 1,   y: 1.5 } # Y
+  - { row: 1, col: 4, x: 2,   y: 1.5 } # U
+  - { row: 1, col: 3, x: 3,   y: 1.5 } # I
+  - { row: 1, col: 2, x: 4,   y: 1.5 } # O
+  - { row: 1, col: 1, x: 5,   y: 1.5 } # P
+  - { row: 1, col: 0, x: 6.5, y: 1.5 } # PageUp
+  # r2
+  - { row: 2, col: 5, x: 1,   y: 2.5 } # H
+  - { row: 2, col: 4, x: 2,   y: 2.5 } # J
+  - { row: 2, col: 3, x: 3,   y: 2.5 } # K
+  - { row: 2, col: 2, x: 4,   y: 2.5 } # L
+  - { row: 2, col: 1, x: 5,   y: 2.5 } # ;
+  - { row: 2, col: 0, x: 6.5, y: 2.5 } # PageDown
+  # r3
+  - { row: 3, col: 5, x: 1,   y: 3.5 } # N
+  - { row: 3, col: 4, x: 2,   y: 3.5 } # M
+  - { row: 3, col: 3, x: 3,   y: 3.5 } # ,
+  - { row: 3, col: 2, x: 4,   y: 3.5 } # .
+  - { row: 3, col: 1, x: 5,   y: 3.5 } # /
+  - { row: 3, col: 0, x: 6.5, y: 3.5 } # Home
+  # r4（親指行）
+  - { row: 4, col: 5, x: 1,   y: 4.5 } # Space
+  - { row: 4, col: 4, x: 2,   y: 4.5 } # Raise
+  - { row: 4, col: 3, x: 3,   y: 4.5 } # BS/Shift
+  - { row: 4, col: 0, x: 6.5, y: 4.5 } # End

@@ -49,6 +49,19 @@ pub const CMD_READ_PARAMS: u8 = 0x08;
 pub const CMD_WRITE_PARAMS: u8 = 0x09;
 pub const CMD_READ_MATRIX: u8 = 0x0a;
 pub const CMD_READ_LASTKEY: u8 = 0x0b;
+/// 全物理スイッチ列挙（#05-future-work §2 Tier 1）。エントリ 5B=[hand,row,col,sc,flags]。
+pub const CMD_READ_MATRIX_FULL: u8 = 0x0c;
+/// キー形状読み出し（#05-future-work §2 Tier 2）。エントリ 8B=[hand,row,col,x,y,w,h,rot]。
+pub const CMD_READ_LAYOUT: u8 = 0x0d;
+
+// --- INFO capability ビット（resp[16]）-------------------------------------
+// 注: #05-future-work の原案は payload[8] だったが、[8..15] は各テーブル件数
+// （u16le×4）で使用済みのため [16] に置く。
+pub const CAP_MATRIX_FULL: u8 = 0x01; // bit0: READ_MATRIX_FULL 対応
+pub const CAP_LAYOUT: u8 = 0x02; // bit1: READ_LAYOUT 対応（layout_* が YAML に記載されている場合のみ）
+pub const CAP_TAG_HOLD: u8 = 0x04; // bit2: TAG_HOLD（ホールド値）対応
+pub const CAP_PASSTHROUGH: u8 = 0x08; // bit3: パススルーモード対応
+pub const CAP_CUSTOM_LAYERS: u8 = 0x10; // bit4: 任意カスタムレイヤー（SEC_CUSTOM）対応
 
 // --- セクション（config.rs の SEC_* と一致させる）--------------------------
 pub const SEC_LAYERS: u8 = 1;
@@ -56,6 +69,7 @@ pub const SEC_COMBO2: u8 = 2;
 pub const SEC_COMBO3: u8 = 3;
 pub const SEC_MODES: u8 = 4;
 pub const SEC_EXTRA: u8 = 5;
+pub const SEC_CUSTOM: u8 = 6;
 
 // --- ステータス -------------------------------------------------------------
 const ST_OK: u8 = 0x00;
@@ -64,7 +78,7 @@ const ST_UNKNOWN: u8 = 0x02;
 
 const PROTO_VER: u8 = 2;
 const FW_MAJOR: u8 = 0;
-const FW_MINOR: u8 = 2;
+const FW_MINOR: u8 = 3;
 
 /// コマンド処理の結果。`reboot` が true なら呼び出し側で sys_reset する。
 pub struct Outcome {
@@ -139,6 +153,12 @@ pub fn handle_command(cmd_buf: &[u8; REPORT_LEN], staged: &mut Config, flash: &m
             put_u16(&mut resp, 10, keymap::COMBO2.len() as u16);
             put_u16(&mut resp, 12, keymap::COMBO3.len() as u16);
             put_u16(&mut resp, 14, keymap::MODE_LAYERS.len() as u16);
+            let mut caps = CAP_MATRIX_FULL | CAP_TAG_HOLD | CAP_PASSTHROUGH | CAP_CUSTOM_LAYERS;
+            if !keymap::LAYOUT_LEFT.is_empty() || !keymap::LAYOUT_RIGHT.is_empty() {
+                caps |= CAP_LAYOUT; // 形状データが YAML に記載されている場合のみ
+            }
+            resp[16] = caps;
+            resp[17] = naginata_core::config::MAX_CUSTOM_LAYERS;
         }
         CMD_READ_DEFAULTS => {
             let section = cmd_buf[2];
@@ -174,6 +194,7 @@ pub fn handle_command(cmd_buf: &[u8; REPORT_LEN], staged: &mut Config, flash: &m
             put_u16(&mut resp, 7, p.repeat_delay_ms);
             put_u16(&mut resp, 9, p.repeat_interval_ms);
             resp[11] = p.led_brightness;
+            resp[12] = p.flags;
         }
         CMD_WRITE_PARAMS => {
             staged.params = Params {
@@ -182,11 +203,21 @@ pub fn handle_command(cmd_buf: &[u8; REPORT_LEN], staged: &mut Config, flash: &m
                 repeat_delay_ms: get_u16(cmd_buf, 6),
                 repeat_interval_ms: get_u16(cmd_buf, 8),
                 led_brightness: cmd_buf[10],
+                // 旧ツールは 9 バイト送信（[11]=0）→ flags=0 のまま（互換）。
+                flags: cmd_buf[11],
             };
         }
         CMD_READ_MATRIX => {
             let start = get_u16(cmd_buf, 2);
             read_matrix(start, &mut resp);
+        }
+        CMD_READ_MATRIX_FULL => {
+            let start = get_u16(cmd_buf, 2);
+            read_matrix_full(start, staged, &mut resp);
+        }
+        CMD_READ_LAYOUT => {
+            let start = get_u16(cmd_buf, 2);
+            read_layout(start, &mut resp);
         }
         CMD_READ_LASTKEY => {
             // ARMv6-M は RMW(swap) 非対応 → load + 条件付き store でクリア（fresh は1回だけ true）。
@@ -311,6 +342,77 @@ fn read_matrix(start: u16, resp: &mut [u8; REPORT_LEN]) {
     resp[6] = count as u8;
 }
 
+/// 全物理スイッチ（PHYS テーブル）を start から詰める（#05-future-work §2 Tier 1）。
+/// entry=[hand][row][col][sc][flags]。sc=0 は薙刀式未割当。
+/// flags: bit0=薙刀式割当あり, bit1=EXTRA（直接キー）割当あり（ステージング基準）。
+fn read_matrix_full(start: u16, staged: &Config, resp: &mut [u8; REPORT_LEN]) {
+    let mut count = 0u16;
+    let mut off = 7usize;
+    let mut idx = 0u16;
+    'outer: for (hand, list) in [(0u8, keymap::PHYS_LEFT), (1u8, keymap::PHYS_RIGHT)] {
+        for (pos, sc) in list {
+            if idx < start {
+                idx += 1;
+                continue;
+            }
+            if off + 5 > REPORT_LEN {
+                break 'outer;
+            }
+            let row = (*pos >> 4) & 0x0f;
+            let col = *pos & 0x0f;
+            let mut flags = 0u8;
+            if *sc != 0 {
+                flags |= 0x01;
+            }
+            if staged.find_extra(hand, row, col).is_some() {
+                flags |= 0x02;
+            }
+            resp[off] = hand;
+            resp[off + 1] = row;
+            resp[off + 2] = col;
+            resp[off + 3] = *sc;
+            resp[off + 4] = flags;
+            off += 5;
+            count += 1;
+            idx += 1;
+        }
+    }
+    put_u16(resp, 4, start + count);
+    resp[6] = count as u8;
+}
+
+/// キー形状（LAYOUT テーブル）を start から詰める（#05-future-work §2 Tier 2）。
+/// entry=[hand][row][col][x][y][w][h][rot]（x/y/w/h は 0.25u 単位、rot は i8 度）。
+fn read_layout(start: u16, resp: &mut [u8; REPORT_LEN]) {
+    let mut count = 0u16;
+    let mut off = 7usize;
+    let mut idx = 0u16;
+    'outer: for (hand, list) in [(0u8, keymap::LAYOUT_LEFT), (1u8, keymap::LAYOUT_RIGHT)] {
+        for (pos, x, y, w, h, rot) in list {
+            if idx < start {
+                idx += 1;
+                continue;
+            }
+            if off + 8 > REPORT_LEN {
+                break 'outer;
+            }
+            resp[off] = hand;
+            resp[off + 1] = (*pos >> 4) & 0x0f;
+            resp[off + 2] = *pos & 0x0f;
+            resp[off + 3] = *x;
+            resp[off + 4] = *y;
+            resp[off + 5] = *w;
+            resp[off + 6] = *h;
+            resp[off + 7] = *rot as u8;
+            off += 8;
+            count += 1;
+            idx += 1;
+        }
+    }
+    put_u16(resp, 4, start + count);
+    resp[6] = count as u8;
+}
+
 /// ステージング Config の差分 section を start から詰める（同形式）。
 fn read_overrides(section: u8, start: u16, staged: &Config, resp: &mut [u8; REPORT_LEN]) {
     resp[3] = section;
@@ -389,6 +491,20 @@ fn read_overrides(section: u8, start: u16, staged: &Config, resp: &mut [u8; REPO
                 count += 1;
             }
         }
+        SEC_CUSTOM => {
+            for (i, (layer, sc, v)) in staged.custom.iter().enumerate() {
+                if (i as u16) < start {
+                    continue;
+                }
+                if off + 2 + v.enc_len() > REPORT_LEN {
+                    break;
+                }
+                resp[off] = *layer;
+                resp[off + 1] = *sc;
+                off = v.encode(resp, off + 2);
+                count += 1;
+            }
+        }
         _ => {}
     }
     put_u16(resp, 4, start + count);
@@ -401,7 +517,7 @@ fn write_entry(cmd_buf: &[u8; REPORT_LEN], staged: &mut Config) -> Result<(), ()
     let section = cmd_buf[2];
     // キーバイト長とキー解釈。
     let (klen, val_off) = match section {
-        SEC_LAYERS | SEC_COMBO2 | SEC_MODES => (2usize, 5usize),
+        SEC_LAYERS | SEC_COMBO2 | SEC_MODES | SEC_CUSTOM => (2usize, 5usize),
         SEC_COMBO3 | SEC_EXTRA => (3usize, 6usize),
         _ => return Err(()),
     };
@@ -452,6 +568,15 @@ fn write_entry(cmd_buf: &[u8; REPORT_LEN], staged: &mut Config) -> Result<(), ()
             } else {
                 let (v, _) = OverrideVal::decode(cmd_buf, val_off).ok_or(())?;
                 staged.set_extra(hand, row, col, v)?;
+            }
+        }
+        SEC_CUSTOM => {
+            let (layer, sc) = (cmd_buf[3], cmd_buf[4]);
+            if is_remove {
+                staged.remove_custom(layer, sc);
+            } else {
+                let (v, _) = OverrideVal::decode(cmd_buf, val_off).ok_or(())?;
+                staged.set_custom(layer, sc, v)?;
             }
         }
         _ => return Err(()),

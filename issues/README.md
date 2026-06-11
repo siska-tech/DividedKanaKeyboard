@@ -19,24 +19,23 @@ LEDで役割＋シフト状態を表示。コア（naginata-core）24テスト�
 | [04](04-v15-layout-transcription.md)      | 薙刀式v15配列の転記（実用データ）                     | P2   | 02       | ✅ Done（句読点まで。拗音1打鍵/外来音/編集は #10） |
 | [05](05-role-detection-eehands.md)        | 役割判定（USB列挙）＋EE_HANDS                         | P2   | 01       | ✅ Done（実機確認）                                |
 | [06](06-split-uart-protocol.md)           | 分割UARTプロトコル実装                                | P2   | 01       | ✅ Done（実機・両手動作）                          |
-| [07](07-ble-hid.md)                       | BLE-HID（cyw43 + trouble-host）                       | P3   | 01,05,06 | 🔲 Todo                                           |
+| [07](07-ble-hid.md)                       | BLE-HID（cyw43 + trouble-host）                       | P3   | 01,05,06 | 🟡 In Progress                                     |
 | [08](08-txt-importer.md)                  | 薙刀式.txt 直読インポータ（上流追従）                 | P3   | 02       | 🗄 Backlog                                        |
 | [09](09-led-status.md)                    | LEDステータス表示（WS2812B）                          | P3   | 01,06    | ✅ Done（実機）                                    |
 | [10](10-combo-engine-extension.md)        | セット型コンボ・エンジン拡張（拗音1打鍵/外来音/編集） | P2   | 03,04    | ✅ Done（左手マクロのみ任意残）                    |
 | [11](11-key-repeat.md)                    | キーリピート機能（長押しでBS/←/→等）                  | P2   | 03,10    | ✅ Done（実機）                                    |
-| [12](12-pc-keymap-customizer.md)          | PCからのキーマップ/設定カスタマイズ（USB/設定ツール） | P3   | 01,02,10 | 🟡 フェーズ3（物理レイアウト＋未使用キー）実装・検証待ち |
-| [13](13-modifier-hold-layers.md)          | 修飾キー長押し保持・モメンタリレイヤ（#12 スコープC） | P3   | 12       | 🔲 Todo                                            |
+| [12](12-pc-keymap-customizer.md)          | PCからのキーマップ/設定カスタマイズ（USB/設定ツール） | P3   | 01,02,10 | ✅ Done（fw 0.3 で全物理キー/形状読み出しまで実装。実機検証は UF2 書込後） |
+| [13](13-modifier-hold-layers.md)          | 修飾キー長押し保持・モメンタリレイヤ（#12 スコープC） | P3   | 12       | ✅ Done（fw 0.3。mod-tap のみ任意残）              |
 
 ## 残り
 
 **薙刀式の基本入力は実機で全て動作。** 残りは無線化・省力化・操作性／カスタマイズ向上。
 
 ```
-07（BLE）          … 無線化（要 cyw43+trouble-host, 詰まればC/C++）★次の大物
-12（PCカスタマイズ）… 再ビルド無しで配列/カスタムキーを編集（USB/設定ツール, フェーズ3まで実装）
-13（修飾/レイヤ）  … 修飾キー長押し保持・モメンタリレイヤ（#12 スコープC）
+07（BLE）          … 無線化（要 cyw43+trouble-host, 詰まればC/C++）★着手中・最後の大物
 08（.txtインポータ）… 上流追従の省力化（任意・Backlog）
 任意: 編集モードの左手マクロ（『』等の挿入）・固有名詞ショートカット（#10内）
+任意: mod-tap（タップ=キー/長押し=修飾。#13 の残し）
 ```
 
 ## 状態凡例

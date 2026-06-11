@@ -32,6 +32,10 @@ pub const MAX_COMBO3: usize = 64;
 pub const MAX_MODES: usize = 32;
 /// 直接キー割当（未使用物理キー, #12 フェーズ3）の上限。
 pub const MAX_EXTRA: usize = 32;
+/// カスタムレイヤー（#05-future-work §3 Tier B）のエントリ総数上限（全レイヤー合算）。
+pub const MAX_CUSTOM: usize = 96;
+/// カスタムレイヤーの最大レイヤー数（擬似 usage の下位 3bit が layer id）。
+pub const MAX_CUSTOM_LAYERS: u8 = 8;
 
 /// LED 輝度スケールの既定値。255 = firmware の status_colors の素の色をそのまま使う。
 pub const DEFAULT_LED_BRIGHTNESS: u8 = 255;
@@ -39,6 +43,42 @@ pub const DEFAULT_LED_BRIGHTNESS: u8 = 255;
 /// 値タグ。
 pub const TAG_KANA: u8 = 0;
 pub const TAG_KEYS: u8 = 1;
+/// ホールド（押しっぱなし保持, #05-future-work §1）。本体 = (usage, mod) 1ペア。
+/// 物理キーの press/release に同期して HID レポートのビットを保持/解除する。
+/// 対象は EXTRA（直接キー）のみ（他セクションでは Action::None 扱い）。
+pub const TAG_HOLD: u8 = 2;
+
+/// 内部擬似 usage（#05-future-work §3）。FW 内部解釈のみで HID には出さない。
+/// EXTRA / カスタムレイヤーの値の (usage, mod) 空間に置き、レイヤー（パススルー系）を活性化する。
+///
+/// `0xF0 | n` = MO(n)（ホールド中有効）、`0xF8 | n` = TG(n)（トグル）。下位 3bit = layer id。
+/// レイヤー 0 はエントリ 0 件の素の QWERTY（パススルー）。1..7 は SEC_CUSTOM のカスタムレイヤー
+/// （未定義 sc はパススルーへ透過）。
+pub mod pseudo {
+    /// MO(n) のベース。`MO_BASE | layer_id`。
+    pub const MO_BASE: u8 = 0xF0;
+    /// TG(n) のベース。`TG_BASE | layer_id`。
+    pub const TG_BASE: u8 = 0xF8;
+    /// ホールド中パススルー有効 = MO(0)。
+    pub const MO_PASS: u8 = MO_BASE;
+    /// パススルーをトグル = TG(0)。
+    pub const TG_PASS: u8 = TG_BASE;
+
+    /// usage が擬似レイヤー操作なら Some((toggle?, layer_id))。
+    pub fn layer_op(usage: u8) -> Option<(bool, u8)> {
+        if usage >= TG_BASE {
+            Some((true, usage & 0x07))
+        } else if usage >= MO_BASE {
+            Some((false, usage & 0x07))
+        } else {
+            None
+        }
+    }
+}
+
+/// Params::flags のビット。
+/// bit0: パススルー有効化時に LANG2（IME OFF）、解除時に LANG1（IME ON）を自動送出。
+pub const PFLAG_PASS_IME: u8 = 0x01;
 
 // セクション ID。
 const SEC_END: u8 = 0;
@@ -47,6 +87,7 @@ const SEC_COMBO2: u8 = 2;
 const SEC_COMBO3: u8 = 3;
 const SEC_MODES: u8 = 4;
 const SEC_EXTRA: u8 = 5;
+const SEC_CUSTOM: u8 = 6;
 
 /// 1 かな文字列（UTF-8, 最大 [`MAX_KANA_LEN`] バイト）。
 pub type KanaStr = String<MAX_KANA_LEN>;
@@ -65,6 +106,9 @@ pub struct Params {
     pub repeat_delay_ms: u16,
     pub repeat_interval_ms: u16,
     pub led_brightness: u8,
+    /// 動作フラグ（[`PFLAG_PASS_IME`] 等）。IR ヘッダの旧予約バイト buf[14] を使うため
+    /// VERSION は据え置き（旧データは 0 = 全フラグ無効として読める）。
+    pub flags: u8,
 }
 
 impl Default for Params {
@@ -75,15 +119,18 @@ impl Default for Params {
             repeat_delay_ms: crate::engine::REPEAT_DELAY_MS as u16,
             repeat_interval_ms: crate::engine::REPEAT_INTERVAL_MS as u16,
             led_brightness: DEFAULT_LED_BRIGHTNESS,
+            flags: 0,
         }
     }
 }
 
-/// 差分の値（かな or キー操作列）。
+/// 差分の値（かな / キー操作列 / ホールド）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OverrideVal {
     Kana(KanaStr),
     Keys(KeysVec),
+    /// 押しっぱなし保持する (usage, modifiers) 1ペア（[`TAG_HOLD`]）。
+    Hold((u8, u8)),
 }
 
 impl OverrideVal {
@@ -101,12 +148,17 @@ impl OverrideVal {
         }
         Ok(OverrideVal::Keys(v))
     }
+    /// (usage,mod) のホールドを作る。
+    pub fn hold(usage: u8, modifiers: u8) -> Self {
+        OverrideVal::Hold((usage, modifiers))
+    }
 
     /// ワイヤ/IR 値のシリアライズ長（tag1 + len1 + payload）。USB プロトコルでも共有。
     pub fn enc_len(&self) -> usize {
         2 + match self {
             OverrideVal::Kana(k) => k.len(),
             OverrideVal::Keys(v) => v.len() * 2,
+            OverrideVal::Hold(_) => 2,
         }
     }
 
@@ -130,6 +182,13 @@ impl OverrideVal {
                     p += 2;
                 }
                 p
+            }
+            OverrideVal::Hold((u, m)) => {
+                buf[off] = TAG_HOLD;
+                buf[off + 1] = 2;
+                buf[off + 2] = *u;
+                buf[off + 3] = *m;
+                off + 4
             }
         }
     }
@@ -165,6 +224,12 @@ impl OverrideVal {
                 }
                 OverrideVal::Keys(v)
             }
+            TAG_HOLD => {
+                if len != 2 {
+                    return None;
+                }
+                OverrideVal::Hold((buf[p], buf[p + 1]))
+            }
             _ => return None,
         };
         Some((val, p + len))
@@ -185,6 +250,8 @@ pub struct Config {
     pub modes: Vec<(u8, u8, OverrideVal), MAX_MODES>,
     /// 未使用物理キーの直接割当: (hand, row, col, 値)。薙刀式エンジンを通さずタップ出力（#12 フェーズ3）。
     pub extra: Vec<(u8, u8, u8, OverrideVal), MAX_EXTRA>,
+    /// カスタムレイヤー差分: (layer_id, sc, 値)。未定義 sc はパススルーへ透過（#05 §3 Tier B）。
+    pub custom: Vec<(u8, u8, OverrideVal), MAX_CUSTOM>,
 }
 
 fn sort2(a: u8, b: u8) -> [u8; 2] {
@@ -308,6 +375,29 @@ impl Config {
             self.extra.swap_remove(i);
         }
     }
+
+    // --- custom（カスタムレイヤー）-----------------------------------------
+    pub fn find_custom(&self, layer: u8, sc: u8) -> Option<&OverrideVal> {
+        self.custom
+            .iter()
+            .find(|(l, s, _)| *l == layer && *s == sc)
+            .map(|(_, _, v)| v)
+    }
+    pub fn set_custom(&mut self, layer: u8, sc: u8, val: OverrideVal) -> Result<(), ()> {
+        if layer >= MAX_CUSTOM_LAYERS {
+            return Err(());
+        }
+        if let Some(slot) = self.custom.iter_mut().find(|(l, s, _)| *l == layer && *s == sc) {
+            slot.2 = val;
+            return Ok(());
+        }
+        self.custom.push((layer, sc, val)).map_err(|_| ())
+    }
+    pub fn remove_custom(&mut self, layer: u8, sc: u8) {
+        if let Some(i) = self.custom.iter().position(|(l, s, _)| *l == layer && *s == sc) {
+            self.custom.swap_remove(i);
+        }
+    }
 }
 
 /// CRC-16/CCITT-FALSE（poly=0x1021, init=0xFFFF）。改ざん/破損検出用。
@@ -343,6 +433,9 @@ pub fn serialize(cfg: &Config, buf: &mut [u8]) -> Option<usize> {
     need += 3 + cfg.combo3.iter().map(|(_, v)| 3 + v.enc_len()).sum::<usize>();
     need += 3 + cfg.modes.iter().map(|(_, _, v)| 2 + v.enc_len()).sum::<usize>();
     need += 3 + cfg.extra.iter().map(|(_, _, _, v)| 3 + v.enc_len()).sum::<usize>();
+    if !cfg.custom.is_empty() {
+        need += 3 + cfg.custom.iter().map(|(_, _, v)| 2 + v.enc_len()).sum::<usize>();
+    }
     need += 1 + 2; // SEC_END + crc16
     if buf.len() < need {
         return None;
@@ -356,7 +449,7 @@ pub fn serialize(cfg: &Config, buf: &mut [u8]) -> Option<usize> {
     put_u16(buf, 9, p.repeat_delay_ms);
     put_u16(buf, 11, p.repeat_interval_ms);
     buf[13] = p.led_brightness;
-    buf[14] = 0;
+    buf[14] = p.flags;
     buf[15] = 0;
 
     let mut off = HEADER_LEN;
@@ -407,6 +500,17 @@ pub fn serialize(cfg: &Config, buf: &mut [u8]) -> Option<usize> {
         buf[off + 2] = *col;
         off = v.encode(buf, off + 3);
     }
+    // CUSTOM（空なら書かない: カスタム未使用の設定は旧FWでもそのまま読める）
+    if !cfg.custom.is_empty() {
+        buf[off] = SEC_CUSTOM;
+        put_u16(buf, off + 1, cfg.custom.len() as u16);
+        off += 3;
+        for (layer, sc, v) in &cfg.custom {
+            buf[off] = *layer;
+            buf[off + 1] = *sc;
+            off = v.encode(buf, off + 2);
+        }
+    }
     // END + CRC
     buf[off] = SEC_END;
     off += 1;
@@ -431,6 +535,7 @@ pub fn parse(buf: &[u8]) -> Option<Config> {
             repeat_delay_ms: get_u16(buf, 9),
             repeat_interval_ms: get_u16(buf, 11),
             led_brightness: buf[13],
+            flags: buf[14],
         },
         ..Default::default()
     };
@@ -496,6 +601,15 @@ pub fn parse(buf: &[u8]) -> Option<Config> {
                     let (v, no) = OverrideVal::decode(buf, off + 3)?;
                     off = no;
                     cfg.set_extra(hand, row, col, v).ok()?;
+                }
+                SEC_CUSTOM => {
+                    if off + 2 > buf.len() {
+                        return None;
+                    }
+                    let (layer, sc) = (buf[off], buf[off + 1]);
+                    let (v, no) = OverrideVal::decode(buf, off + 2)?;
+                    off = no;
+                    cfg.set_custom(layer, sc, v).ok()?;
                 }
                 _ => return None, // 未知セクション
             }
@@ -610,6 +724,61 @@ mod tests {
         assert_eq!(back.find_extra(1, 0, 6), Some(&OverrideVal::keys(&[(0x4c, 0)]).unwrap()));
         cfg.remove_extra(1, 0, 6);
         assert_eq!(cfg.find_extra(1, 0, 6), None);
+    }
+
+    #[test]
+    fn roundtrip_hold_and_flags() {
+        let mut cfg = Config::default();
+        cfg.params.flags = PFLAG_PASS_IME;
+        cfg.set_extra(0, 0, 1, OverrideVal::hold(0xe1, 0)).unwrap(); // 左 r0c1 = Shift ホールド
+        cfg.set_extra(1, 0, 2, OverrideVal::keys(&[(pseudo::MO_PASS, 0)]).unwrap()).unwrap();
+        let mut buf = [0u8; 256];
+        let n = serialize(&cfg, &mut buf).unwrap();
+        let back = parse(&buf[0..n]).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(back.params.flags, PFLAG_PASS_IME);
+        assert_eq!(back.find_extra(0, 0, 1), Some(&OverrideVal::Hold((0xe1, 0))));
+    }
+
+    #[test]
+    fn roundtrip_custom_layers() {
+        let mut cfg = Config::default();
+        cfg.set_custom(1, 0x10, OverrideVal::keys(&[(0x35, 0)]).unwrap()).unwrap(); // L1: q = `
+        cfg.set_custom(1, 0x11, OverrideVal::keys(&[(0x1e, 2)]).unwrap()).unwrap(); // L1: w = !
+        cfg.set_custom(7, 0x39, OverrideVal::keys(&[(pseudo::TG_BASE | 7, 0)]).unwrap()).unwrap();
+        let mut buf = [0u8; 512];
+        let n = serialize(&cfg, &mut buf).unwrap();
+        let back = parse(&buf[0..n]).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(back.find_custom(1, 0x10), Some(&OverrideVal::keys(&[(0x35, 0)]).unwrap()));
+        assert_eq!(back.find_custom(2, 0x10), None);
+        // layer id 上限チェック
+        assert!(cfg.set_custom(8, 0x10, OverrideVal::keys(&[(0x04, 0)]).unwrap()).is_err());
+    }
+
+    #[test]
+    fn custom_empty_keeps_v2_layout() {
+        // custom が空なら SEC_CUSTOM を書かない（旧FWでもそのまま読める）。
+        let cfg = Config::default();
+        let mut buf = [0u8; 256];
+        let n = serialize(&cfg, &mut buf).unwrap();
+        assert!(!buf[..n].windows(3).any(|w| w == [SEC_CUSTOM, 0, 0]));
+    }
+
+    #[test]
+    fn pseudo_layer_op() {
+        assert_eq!(pseudo::layer_op(0xf0), Some((false, 0))); // MO(0) = MO_PASS
+        assert_eq!(pseudo::layer_op(0xf3), Some((false, 3))); // MO(3)
+        assert_eq!(pseudo::layer_op(0xf8), Some((true, 0))); // TG(0) = TG_PASS
+        assert_eq!(pseudo::layer_op(0xff), Some((true, 7))); // TG(7)
+        assert_eq!(pseudo::layer_op(0xe0), None);
+    }
+
+    #[test]
+    fn decode_rejects_bad_hold_len() {
+        // TAG_HOLD は len==2 のみ有効。
+        let buf = [TAG_HOLD, 4, 0xe0, 0, 0xe1, 0];
+        assert!(OverrideVal::decode(&buf, 0).is_none());
     }
 
     #[test]
