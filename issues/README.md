@@ -19,7 +19,7 @@ LEDで役割＋シフト状態を表示。コア（naginata-core）24テスト�
 | [04](04-v15-layout-transcription.md)      | 薙刀式v15配列の転記（実用データ）                     | P2   | 02       | ✅ Done（句読点まで。拗音1打鍵/外来音/編集は #10） |
 | [05](05-role-detection-eehands.md)        | 役割判定（USB列挙）＋EE_HANDS                         | P2   | 01       | ✅ Done（実機確認）                                |
 | [06](06-split-uart-protocol.md)           | 分割UARTプロトコル実装                                | P2   | 01       | ✅ Done（実機・両手動作）                          |
-| [07](07-ble-hid.md)                       | BLE-HID（cyw43 + trouble-host）                       | P3   | 01,05,06 | 🟡 In Progress                                     |
+| [07](07-ble-hid.md)                       | BLE-HID（cyw43 + trouble-host）                       | P3   | 01,05,06 | ✅ 主要実機検証済み（Win/Android/Linux再接続安定。残: 省電力） |
 | [08](08-txt-importer.md)                  | 薙刀式.txt 直読インポータ（上流追従）                 | P3   | 02       | 🗄 Backlog                                        |
 | [09](09-led-status.md)                    | LEDステータス表示（WS2812B）                          | P3   | 01,06    | ✅ Done（実機）                                    |
 | [10](10-combo-engine-extension.md)        | セット型コンボ・エンジン拡張（拗音1打鍵/外来音/編集） | P2   | 03,04    | ✅ Done（左手マクロのみ任意残）                    |
@@ -29,10 +29,10 @@ LEDで役割＋シフト状態を表示。コア（naginata-core）24テスト�
 
 ## 残り
 
-**薙刀式の基本入力は実機で全て動作。** 残りは無線化・省力化・操作性／カスタマイズ向上。
+**薙刀式の基本入力と主要BLE接続は実機で動作。** 残りは省力化・操作性／カスタマイズ向上。
 
 ```
-07（BLE）          … 無線化（要 cyw43+trouble-host, 詰まればC/C++）★着手中・最後の大物
+07（BLE）          … 主要実機検証済み。残: 省電力・追加端末確認・複数ホスト切替
 08（.txtインポータ）… 上流追従の省力化（任意・Backlog）
 任意: 編集モードの左手マクロ（『』等の挿入）・固有名詞ショートカット（#10内）
 任意: mod-tap（タップ=キー/長押し=修飾。#13 の残し）

@@ -12,9 +12,9 @@
 > 配列そのものの著作・設計は大岡俊彦氏に帰属します（[クレジット](#クレジット--ライセンス)）。
 > https://oookaworks.seesaa.net/article/456099128.html
 
-> **状態（2026-06）**: 実機で実用機能フル動作。USB-HID／分割両手入力／全かな（濁音・半濁音・小書き・
+> **状態（2026-06）**: 実機で実用機能フル動作。USB-HID／BLE-HID／分割両手入力／全かな（濁音・半濁音・小書き・
 > 拗音1打鍵・外来音3キー）／句読点・Enter・IME ON-OFF／編集モード／LED表示／EE_HANDS（左右自動判別）。
-> 残りは **BLE無線化(#07)** のみ。コア38テスト緑。
+> BLE は Windows / Android / Linux でペアリング・電源断後再接続を主要実機検証済み。コア70テスト緑。
 
 - 要件: [要件定義.md](Documents/要件定義.md) ／ 設計: [アーキテクチャ設計書.md](Documents/アーキテクチャ設計書.md) ・ [詳細設計書.md](Documents/詳細設計書.md)
 - タスク/進捗: [issues/](issues/README.md)
@@ -34,6 +34,7 @@
 ## ハードウェア
 
 左右で**完全に同一の基板・配線・ファーム**。TRRS ケーブル1本で連結し、USB を挿した側が自動的にマスタになる。
+BLE 有効ファームでは、左手番がUSB未列挙時に BLE-HID マスタとして広告する。
 
 | 区分            | 部品 / 仕様                    | 数量（片側） | 備考                                                 |
 | --------------- | ------------------------------ | ------------ | ---------------------------------------------------- |
@@ -50,15 +51,16 @@
 
 ## 仕組み（ソフトウェア概要）
 
-物理キーから USB HID 出力までを、すべてキーボード内のファームで完結させる。
+物理キーから HID 出力までを、すべてキーボード内のファームで完結させる。
 
 ```
 物理キー(row,col) ─▶ スキャン＋デバウンス ─▶ 手番でスキャンコードへ
    ─▶ 同時打鍵判定エンジン（薙刀式 v3：シフト体系＋2/3キーコンボ＋編集モード）
-   ─▶ かな ─▶ ローマ字（か→ka, ぎゃ→gya …） ─▶ USB HID キーコード ─▶ ホストの標準IMEで確定
+   ─▶ かな ─▶ ローマ字（か→ka, ぎゃ→gya …） ─▶ USB/BLE HID キーコード ─▶ ホストの標準IMEで確定
 ```
 
 - **両半身は同一ファーム**。USB に接続された側がマスタとなり、相方のキー入力を UART で受信して統合する。
+- **BLE有効時**は左手番のみがBLEマスタになり、USB列挙中はUSB、未列挙時はBLEへ出力する。
 - **入力方式の核（エンジン／ローマ字変換）はハード非依存**（`naginata-core`）。ホスト上で単体テストでき、将来の移植も容易。
 - 配列定義は YAML から**ビルド時にテーブル生成**（実行時パース無し）。さらに [設定ツール](https://siska-tech.github.io/naginata-config/) で**再ビルド無しのカスタマイズ**も可能。
 
@@ -66,7 +68,7 @@
 
 ```
 DividedKanaKeyboard/
-├─ naginata-core/         ハード非依存コアロジック（no_std / ホストテスト 38件）
+├─ naginata-core/         ハード非依存コアロジック（no_std / ホストテスト 70件）
 │  ├─ layout/naginata.yaml  薙刀式v15 配列定義（ビルド時に phf へコード生成。実行時パース無し）
 │  ├─ build.rs             YAML → phf テーブル コード生成（LAYERS/COMBO2/COMBO3/MODE_*/MATRIX/SINGLE_TAP_SCS）
 │  └─ src/
@@ -77,13 +79,17 @@ DividedKanaKeyboard/
 │     └─ keymap.rs         生成テーブルのアクセサ（matrix→sc, layer/combo/mode lookup, Hand, ランタイム Overlay #12）
 ├─ firmware/              embassy(RP2040/Pico W)ファーム
 │  └─ src/
-│     ├─ main.rs           タスク統合（usb/scan/uart_tx/uart_rx/engine/led）＋役割判定＋EE_HANDS＋設定適用
+│     ├─ main.rs           タスク統合（usb/ble/scan/uart_tx/uart_rx/engine/led）＋役割判定＋EE_HANDS＋設定適用
+│     ├─ ble.rs            BLE-HID（cyw43 + trouble-host, feature "ble"）
+│     ├─ ble_bond_store.rs BLE bond/CCCD のフラッシュ永続化（1ホスト分）
 │     ├─ matrix.rs         14col×6row COL2ROWスキャン（§2.1）
 │     ├─ split.rs          左右UARTプロトコル（KeyEvent/Status, 自己同期）
 │     ├─ handedness.rs     EE_HANDS（フラッシュに手番L/R保存）
 │     ├─ config_store.rs   設定IRのフラッシュ永続化（#12, 末尾-2番目セクタ）
 │     ├─ usb_config.rs     PC↔端末 設定チャネル（#12, vendor HID, INFO/READ/WRITE/COMMIT/RESET/REBOOT）
-│     └─ usb_hid.rs        HID キーボードレポート
+│     ├─ usb_hid.rs        USB HID キーボードレポート
+│     └─ nvram_rp2040.bin  Pico W CYW43 用NVRAM（BLE feature用）
+│  └─ vendor/trouble-host-0.6.0  BLE再接続安定化のローカルパッチ
 ├─ issues/                タスク分割・進捗
 └─ Documents/             設計ドキュメント（要件/アーキ/詳細）＋ 回路図 / BOM
 ```
@@ -95,7 +101,7 @@ DividedKanaKeyboard/
 
 ### コア（ホストで即実行）
 ```powershell
-cargo test --manifest-path naginata-core/Cargo.toml   # 38 tests
+cargo test --manifest-path naginata-core/Cargo.toml   # 70 tests
 ```
 
 ### ファーム（RP2040, 要 Pico 実機で書込み）
@@ -109,13 +115,24 @@ elf2uf2-rs target/thumbv6m-none-eabi/release/naginata-firmware naginata-firmware
 ```
 versions: Rust 1.96 / embassy-rp 0.10 / embassy-usb 0.6 等（詳細は issue #01）。
 
+BLE-HID を有効にする場合:
+
+```powershell
+cd firmware
+cargo build --release --features ble
+elf2uf2-rs target/thumbv6m-none-eabi/release/naginata-firmware naginata-firmware.uf2
+```
+
+既定ビルドは従来どおり USB-HID のみ。BLE入りFWは左半身だけで足りるが、両半身へ同じUF2を書いても右手番のBLEタスクは終了する。
+
 ## 使い方（実機）
 
 1. **両半身に同じ UF2 を書込み**、TRRSで連結。
 2. **EE_HANDS 手番登録（各半身1回）**: キーを押しながらUSB挿し直し
    - スペース＋上段の外側(小指)キー → **Left** ／ スペース＋上段の内側(人差し)キー → **Right**
 3. **どちらの半身をUSBに挿してもOK**（USB側がマスタ）。ホストの**ローマ字ひらがなIME**をON。
-4. **LED**: 役割（マスタ=緑/スレーブ=青）＋シフト状態（センター=シアン/濁音=赤/半濁音=黄/小書き=青）。
+4. **BLE運用**: BLE入りFWで左手番をUSB未接続のまま起動すると `Naginata Keyboard` として広告。USB接続時はUSB出力を優先。
+5. **LED**: 役割（USBマスタ=緑/BLE広告中=暗マゼンタ/BLE接続中=マゼンタ/BLEペアリング済み=シアン/スレーブ=青）＋シフト状態（センター=シアン/濁音=赤/半濁音=黄/小書き=青）。
 
 ### 入力できるもの
 - 単打・**センターシフト**（スペース）・**濁音/半濁音**（逆手シフト）・**小書き**（Q）
@@ -131,13 +148,13 @@ versions: Rust 1.96 / embassy-rp 0.10 / embassy-usb 0.6 等（詳細は issue #0
 
 | 機能                                                                                     | 状態                                                        |
 | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| コア（engine/romaji/hid/codegen, 38テスト）                                              | ✅                                                          |
+| コア（engine/romaji/hid/codegen/config, 70テスト）                                      | ✅                                                          |
 | USB-HID（1000Hz）/ COL2ROWスキャン                                                       | ✅ 実機                                                     |
 | 分割UART（両手統合）/ EE_HANDS（左右自動）                                               | ✅ 実機                                                     |
 | 全かな・拗音1打鍵・外来音3キー・句読点・IME・編集モード                                  | ✅ 実機                                                     |
 | LEDステータス（WS2812B）                                                                 | ✅ 実機                                                     |
-| **BLE-HID（cyw43+trouble-host）**                                                        | 🔲 #07（次の大物・無線化）                                 |
-| **PCカスタマイズ（[WebHID 設定ツール](https://siska-tech.github.io/naginata-config/)）** | 🟡 #12 フェーズ3（物理レイアウト編集＋未使用キー直接割当） |
+| **BLE-HID（cyw43+trouble-host）**                                                        | ✅ 主要実機検証済み（Win/Android/Linux再接続安定。残: 省電力） |
+| **PCカスタマイズ（[WebHID 設定ツール](https://siska-tech.github.io/naginata-config/)）** | ✅ fw 0.3（全物理キー/形状読み出しまで実装）              |
 | 練習用 [トレーナー](https://siska-tech.github.io/naginata-trainer/)（Web）               | ✅ 公開中                                                   |
 | .txtインポータ / 編集モード左手マクロ・固有名詞SC                                        | 🗄 任意                                                    |
 
@@ -149,7 +166,7 @@ versions: Rust 1.96 / embassy-rp 0.10 / embassy-usb 0.6 等（詳細は issue #0
   **配列の設計・配列定義データ（`*.txt`）の著作は大岡氏に帰属**します。配列定義は本リポジトリには**含めません**
   （`Documents/Reference/` は非公開・git管理外）。薙刀式そのものの利用・入手は大岡俊彦氏の発表に従ってください。
 - **ファーム / コア**: 本リポジトリのコード（`naginata-core` / `firmware`）と設計ドキュメントは作者（Siska Tech Lab.）による実装。
-  使用ライブラリ: [embassy](https://embassy.dev)（RP2040/USB/PIO）、`phf`、`heapless` ほか。
+  使用ライブラリ: [embassy](https://embassy.dev)（RP2040/USB/PIO）、`cyw43`、`trouble-host`、`phf`、`heapless` ほか。
 - **関連 Web ツール**（[トレーナー](https://siska-tech.github.io/naginata-trainer/) / [設定ツール](https://siska-tech.github.io/naginata-config/)）は
   別リポジトリ [siska-tech.github.io](https://github.com/siska-tech/siska-tech.github.io) で公開。
 

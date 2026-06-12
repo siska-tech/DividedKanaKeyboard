@@ -15,11 +15,26 @@ embassy-rp = { version = "0.10", features = ["rp2040", "time-driver", "critical-
 embassy-time = { version = "0.5" }
 embassy-usb = { version = "0.6" }
 embassy-futures = { version = "0.1" }
-embassy-sync = { version = "0.8" }
+# 0.7 に固定: trouble-host(0.6) が embassy-sync 0.7 系のため、gatt_server マクロが参照する
+# `embassy_sync::..::NoopRawMutex` を同一バージョンに揃える（用途は Channel/RawMutex のみで API 互換）。
+embassy-sync = { version = "0.7" }
 
 heapless = "0.8"
 embedded-io-async = "0.7"
 smart-leds = "0.4"
+
+# --- BLE-HID (#07, feature "ble" 時のみ) -----------------------------------
+# cyw43(0.7) と trouble-host(0.6) は共に bt-hci 0.8 系で整合（2026-06-12 調査）。
+cyw43 = { version = "0.7", features = ["bluetooth"], optional = true }
+cyw43-pio = { version = "0.10", optional = true }
+cyw43-firmware = { version = "0.1", features = ["wifi", "bluetooth"], optional = true }
+trouble-host = { version = "0.6", features = ["security", "default-packet-pool"], optional = true }
+bt-hci = { version = "0.8", optional = true }
+rand_core = { version = "0.6", optional = true }
+# gatt_server マクロの生成コードが直接参照する。
+static_cell = { version = "2", optional = true }
+# ARMv6-M(RP2040) は CAS 非対応。依存（static_cell 等）の atomic を critical-section 実装へ。
+portable-atomic = { version = "1", features = ["critical-section"], optional = true }
 
 # Cortex-M ランタイム（inline-asm は不要: 近年の cortex-m は stable asm 内蔵。
 # かつ ARMv6-M(Pico) では BASEPRI 等が無く inline-asm はビルド不可）。
@@ -29,6 +44,26 @@ cortex-m-rt = "0.7"
 # ブリングアップ用パニックハンドラ（defmt版衝突を避けるため halt）。
 # RTTログが要るなら後で defmt-rtt + panic-probe へ差し替え。
 panic-halt = "1"
+
+[features]
+default = []
+# BLE-HID（HID over GATT, #07）。Pico W の CYW43 を使用。無効時は従来の USB-HID のみ。
+ble = [
+    "dep:cyw43",
+    "dep:cyw43-pio",
+    "dep:cyw43-firmware",
+    "dep:trouble-host",
+    "dep:bt-hci",
+    "dep:rand_core",
+    "dep:static_cell",
+    "dep:portable-atomic",
+]
+
+[patch.crates-io]
+# trouble-host 0.6.0 は AuthReq::new() が NoInputNoOutput でも MITM を要求する。
+# HOGP Just Works では BlueZ が Authentication requirements で拒否するため、
+# PoC ではローカルパッチで MITM を外す（Bonding + Secure Connections）。
+trouble-host = { path = "vendor/trouble-host-0.6.0" }
 
 [profile.release]
 debug = 2

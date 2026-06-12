@@ -12,7 +12,9 @@
 
 use core::sync::atomic::Ordering;
 
-use naginata_core::config::{Config, OverrideVal, Params, MAX_KANA_LEN, MAX_KEYS, TAG_KANA, TAG_KEYS};
+use naginata_core::config::{
+    Config, OverrideVal, Params, MAX_KANA_LEN, MAX_KEYS, TAG_KANA, TAG_KEYS,
+};
 use naginata_core::{keymap, Action};
 
 use crate::config_store;
@@ -133,7 +135,11 @@ fn action_len(a: Action) -> usize {
 }
 
 /// 1 コマンドを処理し、応答レポートを組み立てる。
-pub fn handle_command(cmd_buf: &[u8; REPORT_LEN], staged: &mut Config, flash: &mut HandFlash) -> Outcome {
+pub fn handle_command(
+    cmd_buf: &[u8; REPORT_LEN],
+    staged: &mut Config,
+    flash: &mut HandFlash,
+) -> Outcome {
     let cmd = cmd_buf[0];
     let seq = cmd_buf[1];
     let mut resp = [0u8; REPORT_LEN];

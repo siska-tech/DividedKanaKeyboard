@@ -13,3 +13,8 @@ Documents/Reference/
 
 # PC設定ツール / トレーナー（別リポジトリ siska-tech.github.io で公開）
 site/
+
+# cargo registry metadata copied with vendored path dependencies
+firmware/vendor/**/.cargo-ok
+firmware/vendor/**/.cargo_vcs_info.json
+firmware/vendor/**/Cargo.lock

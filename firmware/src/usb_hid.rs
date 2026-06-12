@@ -9,7 +9,8 @@
 use naginata_core::hid::KeyPress;
 
 /// USB HID Boot Keyboard レポートディスクリプタ（標準）。
-pub const KEYBOARD_REPORT_DESCRIPTOR: &[u8] = &[
+/// BLE-HID（#07）の Report Map 特性とも共用するため固定長配列でも公開する。
+pub const KEYBOARD_REPORT_DESCRIPTOR_ARR: [u8; 45] = [
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x06, // Usage (Keyboard)
     0xA1, 0x01, // Collection (Application)
@@ -34,6 +35,9 @@ pub const KEYBOARD_REPORT_DESCRIPTOR: &[u8] = &[
     0x81, 0x00, //   Input (Data,Array)    ; key array
     0xC0, // End Collection
 ];
+
+/// 同上のスライス版（embassy-usb の Config が要求する形）。
+pub const KEYBOARD_REPORT_DESCRIPTOR: &[u8] = &KEYBOARD_REPORT_DESCRIPTOR_ARR;
 
 const LEFT_SHIFT: u8 = 0xE1;
 

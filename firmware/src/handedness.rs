@@ -49,6 +49,8 @@ pub fn write_hand(flash: &mut HandFlash, hand: Hand) -> Result<(), ()> {
     flash
         .blocking_erase(STORAGE_OFFSET, STORAGE_OFFSET + ERASE_SIZE as u32)
         .map_err(|_| ())?;
-    flash.blocking_write(STORAGE_OFFSET, &page).map_err(|_| ())?;
+    flash
+        .blocking_write(STORAGE_OFFSET, &page)
+        .map_err(|_| ())?;
     Ok(())
 }

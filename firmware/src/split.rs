@@ -59,7 +59,11 @@ mod tests {
     use super::*;
     #[test]
     fn key_roundtrip() {
-        let e = KeyEvent { row: 5, col: 13, pressed: true };
+        let e = KeyEvent {
+            row: 5,
+            col: 13,
+            pressed: true,
+        };
         let [a, b] = e.encode();
         assert_eq!(decode(a, b), Some(Frame::Key(e)));
     }

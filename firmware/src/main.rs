@@ -13,7 +13,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_futures::join::join3;
@@ -21,10 +21,12 @@ use embassy_futures::select::{select, Either};
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
-use embassy_rp::peripherals::{DMA_CH0, PIO0, UART0, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH2, PIO0, PIO1, UART0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
-use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx, Config as UartConfig};
+use embassy_rp::uart::{
+    BufferedInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx, Config as UartConfig,
+};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
@@ -35,10 +37,14 @@ use embedded_io_async::{Read, Write};
 use panic_halt as _;
 use smart_leds::RGB8;
 
+use keymap::Hand;
 use naginata_core::config::Config;
 use naginata_core::{hid as nghid, keymap, romaji, Action, Engine};
-use keymap::Hand;
 
+#[cfg(feature = "ble")]
+mod ble;
+#[cfg(feature = "ble")]
+mod ble_bond_store;
 mod config_store;
 mod handedness;
 #[allow(dead_code)]
@@ -55,7 +61,8 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
-    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
+    PIO1_IRQ_0 => PioInterruptHandler<PIO1>; // CYW43 SPI（#07 BLE。未使用時も束縛は無害）
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH2>;
 });
 
 /// ShiftMask ビット（layout/naginata.yaml の bit と一致）。LED表示用。
@@ -73,8 +80,18 @@ static REMOTE_SHIFTS: AtomicU8 = AtomicU8::new(0);
 /// true で配列/エンジンを通さず押下位置を `r{行}c{列} ` と打鍵する。
 const RAW_MATRIX_TEST: bool = false;
 
-/// USB が Configured（ホストに列挙）されているか = この半身がマスタか。
-static USB_CONFIGURED: AtomicBool = AtomicBool::new(false);
+/// USB が Configured（ホストに列挙）されているか。
+pub static USB_CONFIGURED: AtomicBool = AtomicBool::new(false);
+
+/// BLE の状態（#07）: 0=off / 1=広告中 / 2=接続中。feature "ble" 無効時は常に 0。
+/// ble_task が更新し、役割判定と LED 表示が参照する。
+pub static BLE_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// この半身がマスタ（= engine で変換して出力する側）か。
+/// USB 列挙中、または BLE 活性中（広告/接続。左手番のみ）にマスタになる（FR-5.2）。
+fn is_master() -> bool {
+    USB_CONFIGURED.load(Ordering::Relaxed) || BLE_STATE.load(Ordering::Relaxed) != 0
+}
 
 /// learn-key（#12 フェーズ3）: 最後に押された物理位置 `(hand<<12)|(row<<4)|col`。
 /// bit15=fresh（READ_LASTKEY で取得時にクリア）。未使用キーの (hand,row,col) 同定に使う。
@@ -171,6 +188,9 @@ async fn main(spawner: Spawner) {
     }
     // 保存値を読む。未設定なら暫定 Left（要プロビジョニング）。
     let local_hand = handedness::read_hand(&mut flash).unwrap_or(Hand::Left);
+    #[cfg(feature = "ble")]
+    let initial_bond = ble_bond_store::read_bond(&mut flash)
+        .map(|stored| (stored.local_address, stored.bond, stored.cccd));
 
     // --- PC カスタマイズ設定（#12）----------------------------------------
     // flash のユーザ設定を読む（未保存/破損なら codegen 既定へフォールバック）。
@@ -200,19 +220,41 @@ async fn main(spawner: Spawner) {
     spawner.spawn(uart_tx_task(uart_tx).unwrap());
     spawner.spawn(uart_rx_task(uart_rx, local_hand).unwrap());
     spawner.spawn(scan_task(matrix, local_hand).unwrap());
-    spawner.spawn(engine_task(
-        params.window_ms as u32,
-        params.repeat_delay_ms as u32,
-        params.repeat_interval_ms as u32,
-        params.flags,
-        overlay,
-        direct,
-        custom,
-    ).unwrap());
+    spawner.spawn(
+        engine_task(
+            params.window_ms as u32,
+            params.repeat_delay_ms as u32,
+            params.repeat_interval_ms as u32,
+            params.flags,
+            overlay,
+            direct,
+            custom,
+        )
+        .unwrap(),
+    );
+
+    // --- BLE-HID（#07, feature "ble"）--------------------------------------
+    // 左手番のみ・起動3秒以内に USB 列挙が無ければ広告開始（詳細は ble.rs 冒頭）。
+    #[cfg(feature = "ble")]
+    spawner.spawn(
+        ble::ble_task(
+            p.PIN_23,
+            p.PIN_24,
+            p.PIN_25,
+            p.PIN_29,
+            p.PIO1,
+            p.DMA_CH2,
+            local_hand,
+            initial_bond,
+        )
+        .unwrap(),
+    );
 
     // --- WS2812B ステータスLED（GP28, 2個）--------------------------------
     // PIO0+DMA で駆動。pio.common はローカル借用だが main は無限ループするので問題なし。
-    let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+    let Pio {
+        mut common, sm0, ..
+    } = Pio::new(p.PIO0, Irqs);
     let program = PioWs2812Program::new(&mut common);
     let mut ws: PioWs2812<'_, PIO0, 0, 2, _> =
         PioWs2812::new(&mut common, sm0, p.DMA_CH0, Irqs, p.PIN_28, &program);
@@ -224,7 +266,9 @@ async fn main(spawner: Spawner) {
     let mut last_sent: u8 = 0xff; // 相方へ最後に送ったシフト状態（強制初回送信）
     let mut heartbeat: u8 = 0;
     loop {
-        let master = USB_CONFIGURED.load(Ordering::Relaxed);
+        let usb = USB_CONFIGURED.load(Ordering::Relaxed);
+        let ble = BLE_STATE.load(Ordering::Relaxed);
+        let master = usb || ble != 0;
         // マスタは自分の状態、スレーブはマスタから受信した状態。
         let cur = if master {
             HELD_SHIFTS.load(Ordering::Relaxed)
@@ -250,9 +294,12 @@ async fn main(spawner: Spawner) {
         } else {
             latch = 0;
         }
-        let cols = status_colors(master, latch);
-        ws.write(&[scale_rgb(cols[0], led_brightness), scale_rgb(cols[1], led_brightness)])
-            .await;
+        let cols = status_colors(usb, ble, latch);
+        ws.write(&[
+            scale_rgb(cols[0], led_brightness),
+            scale_rgb(cols[1], led_brightness),
+        ])
+        .await;
         ticker.next().await;
     }
 }
@@ -292,7 +339,10 @@ unsafe fn oval_to_action(
                 return Action::None;
             }
             for (i, &(u, m)) in kv.iter().enumerate() {
-                *kps.add(*kpos + i) = nghid::KeyPress { usage: u, modifiers: m };
+                *kps.add(*kpos + i) = nghid::KeyPress {
+                    usage: u,
+                    modifiers: m,
+                };
             }
             let sl = core::slice::from_raw_parts(kps.add(*kpos) as *const nghid::KeyPress, n);
             *kpos += n;
@@ -311,7 +361,10 @@ fn build_overlay(cfg: &Config) -> &'static keymap::Overlay {
     const BCAP: usize = 1024; // かなバイトアリーナ
     const KCAP: usize = 512; // KeyPress アリーナ
     static mut BYTES: [u8; BCAP] = [0u8; BCAP];
-    static mut KPS: [nghid::KeyPress; KCAP] = [nghid::KeyPress { usage: 0, modifiers: 0 }; KCAP];
+    static mut KPS: [nghid::KeyPress; KCAP] = [nghid::KeyPress {
+        usage: 0,
+        modifiers: 0,
+    }; KCAP];
     static mut OV_LAYERS: [(u16, Action); cfgmod::MAX_LAYERS] =
         [(0u16, Action::None); cfgmod::MAX_LAYERS];
     static mut OV_COMBO2: [(u16, Action); cfgmod::MAX_COMBO2] =
@@ -408,7 +461,10 @@ fn classify_pseudo(v: &naginata_core::config::OverrideVal) -> Option<Direct> {
         if let Some((tg, n)) = pseudo::layer_op(u) {
             Some(if tg { Direct::Tg(n) } else { Direct::Mo(n) })
         } else if hold {
-            Some(Direct::Hold(nghid::KeyPress { usage: u, modifiers: m }))
+            Some(Direct::Hold(nghid::KeyPress {
+                usage: u,
+                modifiers: m,
+            }))
         } else {
             None
         }
@@ -427,7 +483,10 @@ fn build_direct(cfg: &Config) -> &'static [(u16, Direct)] {
     const BCAP: usize = 256;
     const KCAP: usize = 256;
     static mut BYTES: [u8; BCAP] = [0u8; BCAP];
-    static mut KPS: [nghid::KeyPress; KCAP] = [nghid::KeyPress { usage: 0, modifiers: 0 }; KCAP];
+    static mut KPS: [nghid::KeyPress; KCAP] = [nghid::KeyPress {
+        usage: 0,
+        modifiers: 0,
+    }; KCAP];
     static mut TABLE: [(u16, Direct); cfgmod::MAX_EXTRA] =
         [(0u16, Direct::Tap(Action::None)); cfgmod::MAX_EXTRA];
     let mut bpos = 0usize;
@@ -442,7 +501,9 @@ fn build_direct(cfg: &Config) -> &'static [(u16, Direct)] {
                 break;
             }
             let d = classify_pseudo(v).unwrap_or_else(|| {
-                Direct::Tap(oval_to_action(v, bytes, BCAP, &mut bpos, kps, KCAP, &mut kpos))
+                Direct::Tap(oval_to_action(
+                    v, bytes, BCAP, &mut bpos, kps, KCAP, &mut kpos,
+                ))
             });
             let h = if *hand == 0 { Hand::Left } else { Hand::Right };
             *tp.add(n) = (pack_pos(h, *row, *col), d);
@@ -459,7 +520,10 @@ fn build_custom(cfg: &Config) -> &'static [(u16, Direct)] {
     const BCAP: usize = 512;
     const KCAP: usize = 384;
     static mut BYTES: [u8; BCAP] = [0u8; BCAP];
-    static mut KPS: [nghid::KeyPress; KCAP] = [nghid::KeyPress { usage: 0, modifiers: 0 }; KCAP];
+    static mut KPS: [nghid::KeyPress; KCAP] = [nghid::KeyPress {
+        usage: 0,
+        modifiers: 0,
+    }; KCAP];
     static mut TABLE: [(u16, Direct); cfgmod::MAX_CUSTOM] =
         [(0u16, Direct::Tap(Action::None)); cfgmod::MAX_CUSTOM];
     let mut bpos = 0usize;
@@ -474,7 +538,9 @@ fn build_custom(cfg: &Config) -> &'static [(u16, Direct)] {
                 break;
             }
             let d = classify_pseudo(v).unwrap_or_else(|| {
-                Direct::Tap(oval_to_action(v, bytes, BCAP, &mut bpos, kps, KCAP, &mut kpos))
+                Direct::Tap(oval_to_action(
+                    v, bytes, BCAP, &mut bpos, kps, KCAP, &mut kpos,
+                ))
             });
             *tp.add(n) = (((*layer as u16) << 8) | *sc as u16, d);
             n += 1;
@@ -484,12 +550,26 @@ fn build_custom(cfg: &Config) -> &'static [(u16, Direct)] {
 }
 
 /// ステータス → 2個のWS2812B 色（両LED同じ＝LED1個でもシフトが見える）。
-/// シフトなし=役割色（マスタ緑/スレーブ青）、シフト中=シフト色。
-fn status_colors(master: bool, s: u8) -> [RGB8; 2] {
-    let role = if master {
-        RGB8::new(0, 24, 0) // 緑: マスタ
+/// シフトなし=役割色、シフト中=シフト色（FR-6: USB/BLE/ペアリング状態の区別）。
+/// BLE 状態は ble.rs の BLE_STATE 値（1=広告中 2=接続中 3=ペアリング済 4..10=失敗詳細）。
+/// Pico W 本体 LED（WL_GPIO0, ble.rs wl_led）でも点滅パターンで同じ状態を表示する。
+fn status_colors(usb: bool, ble: u8, s: u8) -> [RGB8; 2] {
+    let role = if usb {
+        RGB8::new(0, 24, 0) // 緑: USB マスタ
     } else {
-        RGB8::new(0, 0, 24) // 青: スレーブ
+        match ble {
+            1 => RGB8::new(8, 0, 8),     // 暗マゼンタ: BLE 広告中（接続待ち）
+            2 => RGB8::new(28, 0, 28),   // マゼンタ: BLE 接続中（ペアリング/購読待ち）
+            3 => RGB8::new(0, 24, 24),   // シアン: BLE ペアリング済み（暗号化確立）
+            4 => RGB8::new(40, 0, 0),    // 赤: ペアリング失敗（切断後3秒保持）
+            5 => RGB8::new(32, 24, 0),   // 黄: PassKey 要求（NoInputNoOutput では想定外）
+            6 => RGB8::new(40, 16, 0),   // 橙: Security Request 送信失敗
+            7 => RGB8::new(40, 0, 24),   // ピンク: ホスト側から切断
+            8 => RGB8::new(40, 0, 0),    // 赤: 認証/鍵関連で切断
+            9 => RGB8::new(0, 0, 40),    // 明青: 接続タイムアウト
+            10 => RGB8::new(24, 24, 24), // 白: その他の切断理由
+            _ => RGB8::new(0, 0, 24),    // 青: スレーブ
+        }
     };
     let c = if s != 0 { shift_color(s) } else { role };
     [c, c]
@@ -536,7 +616,11 @@ impl Handler for StateHandler {
 }
 
 #[embassy_executor::task]
-async fn usb_task(driver: Driver<'static, USB>, mut flash: handedness::HandFlash<'static>, initial_cfg: Config) {
+async fn usb_task(
+    driver: Driver<'static, USB>,
+    mut flash: handedness::HandFlash<'static>,
+    initial_cfg: Config,
+) {
     let mut config = UsbConfig::new(0xc0de, 0xcafe);
     config.manufacturer = Some("Siska Tech Lab.");
     config.product = Some("Naginata Keyboard");
@@ -573,7 +657,7 @@ async fn usb_task(driver: Driver<'static, USB>, mut flash: handedness::HandFlash
     };
     let mut writer = HidWriter::<_, 8>::new(&mut builder, &mut kbd_state, kbd_config);
 
-    // IF1: vendor HID 設定チャネル（#12, VIA 類似, 32B in/out）。
+    // IF1: vendor HID 設定チャネル（#12, VIA 類似, 64B in/out）。
     let cfg_hid_config = hid::Config {
         report_descriptor: usb_config::VENDOR_REPORT_DESCRIPTOR,
         request_handler: None,
@@ -582,20 +666,27 @@ async fn usb_task(driver: Driver<'static, USB>, mut flash: handedness::HandFlash
         hid_subclass: hid::HidSubclass::No,
         hid_boot_protocol: hid::HidBootProtocol::None,
     };
-    let cfg_rw =
-        HidReaderWriter::<_, { usb_config::REPORT_LEN }, { usb_config::REPORT_LEN }>::new(
-            &mut builder,
-            &mut cfg_state,
-            cfg_hid_config,
-        );
+    let cfg_rw = HidReaderWriter::<_, { usb_config::REPORT_LEN }, { usb_config::REPORT_LEN }>::new(
+        &mut builder,
+        &mut cfg_state,
+        cfg_hid_config,
+    );
 
     let mut usb = builder.build();
     let usb_fut = usb.run();
+    // HID 出力経路（FR-5.2: USB優先/BLEフォールバック）。
+    // USB 列挙中は USB へ、未列挙なら BLE へ転送（feature "ble" 無効時は破棄。
+    // 非マスタはそもそもレポートを生成しないため実質無影響）。
     let hid_fut = async {
         loop {
             let mut report = REPORTS.receive().await;
             merge_held(&mut report); // ホールド中のキーを全レポートへ合成（#05 §1）
-            let _ = writer.write(&report).await;
+            if USB_CONFIGURED.load(Ordering::Relaxed) {
+                let _ = writer.write(&report).await;
+            } else {
+                #[cfg(feature = "ble")]
+                let _ = ble::BLE_REPORTS.try_send(report);
+            }
         }
     };
     // 設定チャネル: OUT を受信 → コマンド処理（ステージング更新/COMMIT/RESET）→ IN で応答。
@@ -604,14 +695,49 @@ async fn usb_task(driver: Driver<'static, USB>, mut flash: handedness::HandFlash
     let cfg_fut = async {
         let mut buf = [0u8; usb_config::REPORT_LEN];
         loop {
-            if cfg_reader.read(&mut buf).await.is_err() {
-                continue;
+            #[cfg(feature = "ble")]
+            match select(
+                cfg_reader.read(&mut buf),
+                ble::BOND_STORE_COMMANDS.receive(),
+            )
+            .await
+            {
+                Either::First(read_result) => {
+                    if read_result.is_err() {
+                        continue;
+                    }
+                    let outcome = usb_config::handle_command(&buf, &mut staged, &mut flash);
+                    let _ = cfg_writer.write(&outcome.resp).await;
+                    if outcome.reboot {
+                        Timer::after(Duration::from_millis(50)).await; // 応答送出を待つ
+                        cortex_m::peripheral::SCB::sys_reset();
+                    }
+                }
+                Either::Second(cmd) => match cmd {
+                    ble::BondStoreCommand::Save {
+                        local_address,
+                        bond,
+                        cccd,
+                    } => {
+                        let _ = ble_bond_store::write_bond(&mut flash, local_address, &bond, cccd);
+                    }
+                    ble::BondStoreCommand::Erase => {
+                        let _ = ble_bond_store::erase_bond(&mut flash);
+                    }
+                },
             }
-            let outcome = usb_config::handle_command(&buf, &mut staged, &mut flash);
-            let _ = cfg_writer.write(&outcome.resp).await;
-            if outcome.reboot {
-                Timer::after(Duration::from_millis(50)).await; // 応答送出を待つ
-                cortex_m::peripheral::SCB::sys_reset();
+
+            #[cfg(not(feature = "ble"))]
+            {
+                if cfg_reader.read(&mut buf).await.is_err() {
+                    continue;
+                }
+                let outcome = usb_config::handle_command(&buf, &mut staged, &mut flash);
+                let _ = cfg_writer.write(&outcome.resp).await;
+                if outcome.reboot {
+                    Timer::after(Duration::from_millis(50)).await; // 応答送出を待つ
+                    cortex_m::peripheral::SCB::sys_reset();
+                }
             }
         }
     };
@@ -733,13 +859,16 @@ async fn engine_task(
     loop {
         match select(ENGINE_IN.receive(), ticker.next()).await {
             Either::First(ev) => {
-                if !USB_CONFIGURED.load(Ordering::Relaxed) {
+                if !is_master() {
                     continue; // スレーブ: 自分では変換しない
                 }
                 let now = Instant::now().as_millis() as u32;
                 // learn-key(#12): 押下のたびに最後の物理位置を記録（未使用キー同定用）。
                 if ev.pressed {
-                    LAST_KEY.store(pack_pos(ev.hand, ev.row, ev.col) | 0x8000, Ordering::Relaxed);
+                    LAST_KEY.store(
+                        pack_pos(ev.hand, ev.row, ev.col) | 0x8000,
+                        Ordering::Relaxed,
+                    );
                 }
                 let pk = pack_pos(ev.hand, ev.row, ev.col);
                 let mut layers_dirty = false;
@@ -846,7 +975,8 @@ async fn engine_task(
                     } else {
                         engine.release(sc, now, &mut sink);
                     }
-                    HELD_SHIFTS.store(engine.display_shifts(), Ordering::Relaxed); // LED用
+                    HELD_SHIFTS.store(engine.display_shifts(), Ordering::Relaxed);
+                    // LED用
                 }
 
                 // レイヤー活性の再計算と遷移処理。
@@ -874,7 +1004,7 @@ async fn engine_task(
                 }
             }
             Either::Second(_) => {
-                if !USB_CONFIGURED.load(Ordering::Relaxed) {
+                if !is_master() {
                     continue;
                 }
                 let now = Instant::now().as_millis() as u32;
@@ -933,7 +1063,10 @@ fn layer_transition(
     let _ = REPORTS.try_send(usb_hid::release_report());
     if ime && (cur.is_none() != new.is_none()) {
         let usage = if new.is_some() { 0x91 } else { 0x90 }; // LANG2（英数）/ LANG1（かな）
-        send_stroke(nghid::KeyPress { usage, modifiers: 0 });
+        send_stroke(nghid::KeyPress {
+            usage,
+            modifiers: 0,
+        });
     }
     *cur = new;
 }
